@@ -14,7 +14,7 @@ Pipeline (per .rs file):
 Windows notes:
 - rustc compile runs with cwd=rs_file.parent and uses rs_file.name to avoid path duplication.
 - rustc -o uses an ABSOLUTE output path to avoid rustc trying to create rmeta temp dirs under
-  Samples\<model>\out\... (which can fail if those relative paths don't exist).
+  Samples/<model>/out/... (which can fail if those relative paths don't exist).
 """
 
 import argparse
