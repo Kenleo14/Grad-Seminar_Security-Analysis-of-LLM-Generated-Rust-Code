@@ -1,110 +1,133 @@
-//! # Fixed rust_binder Node Death-List Handling (CVE-2025-68260)
-//!
-//! This module contains the **post-fix** implementation of `Node::release`
-//! for the Rust Android Binder driver.
-//!
-//! ## CVE-2025-68260 Summary (First Rust CVE in Linux)
-//! - **Root cause**: In `Node::release`, `core::mem::take` moved the entire
-//!   intrusive `death_list` to a stack temporary, the lock was dropped,
-//!   and the temporary list was iterated unlocked.
-//! - **Unsafe violation**: Concurrent `node_inner.death_list.remove(...)`
-//!   (with SAFETY comment assuming "this list or none") raced on the
-//!   embedded `prev`/`next` pointers now owned by the *stack* list.
-//! - **Aliasing rules broken**: Two different `List` instances had overlapping
-//!   mutable access to the same intrusive links → data race / UB.
-//! - **Manifestation**: Kernel oops (DoS) via corrupted list pointers.
-//! - **Fix strategy**: Pop elements *one-by-one from the original list* under
-//!   the lock, process unlocked, reacquire only for the next pop.
-//!   This keeps the synchronization invariant alive for the *entire*
-//!   lifecycle of every list element transfer.
-//!
-//! The `oneway_todo` path already used this safe per-item pattern;
-//! `death_list` now matches it exactly.
-//!
-//! ## Why this maintains Rust's aliasing & synchronization invariants
-//! - The *canonical* `death_list` instance remains the sole owner of
-//!   every `NodeDeath`'s links at all times.
-//! - No second `List` ever exists while the lock is dropped.
-//! - Every mutation of the list (pop/remove) happens while the lock
-//!   is held; processing happens only after the element has been
-//!   exclusively removed.
-//! - No data race on `prev`/`next` fields is possible.
-//!
-//! Edge cases covered:
-//! - Empty list → immediate return.
-//! - Single element → one lock release/reacquire.
-//! - Long list under contention → lock is released promptly after each pop.
-//! - Nested callbacks in `set_dead` → cannot deadlock (lock not held).
-//! - Concurrent registration/unregistration → fully serialized by the mutex.
+//! Fixed simplified Android Binder Node management system.
+//! Addresses CVE-2025-68260 by maintaining the synchronization invariant
+//! for the *entire* list-transfer lifecycle (swap + processing).
+//! The intrusive list is protected by the mutex at all times; the temp list
+//! never escapes the locked section.
 
-#![no_std]
-#![allow(unused)] // For illustration; real kernel code has full context
+use std::ptr::NonNull;
+use std::sync::{Arc, Mutex};
 
-use kernel::prelude::*;
-use kernel::sync::MutexGuard;
-use kernel::linked_list::List; // kernel's intrusive List
-
-/// Minimal illustration of the types involved (real kernel code has more fields).
-pub struct NodeInner {
-    pub oneway_todo: List<Arc<WorkItem>>, // simplified
-    pub death_list: List<Arc<NodeDeath>>,
+/// Death notification entry with embedded intrusive links.
+pub struct DeathNotification {
+    id: u64,
+    callback: Option<Box<dyn FnOnce(u64) + Send>>,
+    links: ListLinks,
 }
 
-pub struct Node {
-    pub owner: Arc<Process>, // owns the inner mutex
-    pub inner: /* ... some guarded inner accessor ... */,
+#[derive(Default)]
+struct ListLinks {
+    next: Option<NonNull<DeathNotification>>,
+    prev: Option<NonNull<DeathNotification>>,
 }
 
-/// Placeholder for real kernel types.
-pub struct Process {
-    inner: Mutex<NodeInner>,
-}
-pub struct WorkItem;
-pub struct NodeDeath;
-
-impl NodeDeath {
-    pub fn into_arc(self) -> Arc<Self> { todo!("real impl") }
-    pub fn set_dead(self: Arc<Self>) { /* notify clients */ }
-}
-
-impl WorkItem {
-    pub fn into_arc(self) -> Arc<Self> { todo!("real impl") }
-    pub fn cancel(self: Arc<Self>) { /* cancel work */ }
-}
-
-impl Node {
-    /// Fixed `release` – maintains lock-protected list invariant for the
-    /// entire transfer lifecycle.
-    pub(crate) fn release(&self) {
-        let mut guard = self.owner.inner.lock();
-
-        // First drain oneway_todo (already used the safe pattern pre-CVE)
-        while let Some(work) = self.inner.access_mut(&mut guard).oneway_todo.pop_front() {
-            // Release lock before potentially long-running work
-            drop(guard);
-            work.into_arc().cancel();
-            // Reacquire for the next item
-            guard = self.owner.inner.lock();
+impl DeathNotification {
+    pub fn new(id: u64, callback: impl FnOnce(u64) + Send + 'static) -> Self {
+        Self {
+            id,
+            callback: Some(Box::new(callback)),
+            links: ListLinks::default(),
         }
-
-        // Fixed death_list path – the actual CVE fix.
-        // We pop one element at a time from the *original* list while the
-        // lock is held. This guarantees:
-        // 1. The intrusive links are never owned by a second List.
-        // 2. No concurrent remove can touch the same prev/next pointers.
-        // 3. The SAFETY contract on List::remove remains valid everywhere.
-        while let Some(death) = self.inner.access_mut(&mut guard).death_list.pop_front() {
-            // Element is now exclusively removed from the canonical list.
-            // Lock can safely be dropped for processing.
-            drop(guard);
-            death.into_arc().set_dead();
-            // Reacquire only for the next pop (or exit if list empty).
-            guard = self.owner.inner.lock();
-        }
-        // Lock is dropped automatically when `guard` goes out of scope.
     }
 }
 
-// In real kernel code this would live in drivers/android/binder/node.rs
-// The patch that landed in stable (3e0ae02ba831) is exactly this change
-// for the death_list loop.
+struct BinderNodeInner {
+    death_list_head: Option<NonNull<DeathNotification>>,
+}
+
+pub struct BinderNode {
+    inner: Mutex<BinderNodeInner>,
+}
+
+impl BinderNode {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(BinderNodeInner {
+                death_list_head: None,
+            }),
+        }
+    }
+
+    /// Register a death notification. Ownership transferred to the list.
+    pub fn register_death(&self, death: Box<DeathNotification>) {
+        let entry = NonNull::new(Box::into_raw(death)).expect("Box::into_raw never returns null");
+        let mut guard = self.inner.lock().unwrap();
+        add_to_list(&mut guard.death_list_head, entry);
+    }
+
+    /// Example unsafe removal path (mirrors rust_binder). In a real system
+    /// this would be exposed via a registration token. The safety contract
+    /// is now upheld because the release path never drops the lock early.
+    pub unsafe fn unregister_death(&self, death: NonNull<DeathNotification>) {
+        let mut guard = self.inner.lock().unwrap();
+        remove_from_list(&mut guard.death_list_head, death);
+    }
+}
+
+/// O(1) add to front (same as before).
+fn add_to_list(head: &mut Option<NonNull<DeathNotification>>, entry: NonNull<DeathNotification>) {
+    unsafe {
+        let entry_mut = entry.as_mut();
+        entry_mut.links.next = *head;
+        entry_mut.links.prev = None;
+        if let Some(old) = *head {
+            old.as_mut().links.prev = Some(entry);
+        }
+        *head = Some(entry);
+    }
+}
+
+/// Unsafe removal by direct pointer surgery (mirrors the CVE-vulnerable code).
+/// # Safety
+/// - The entry must be in this list or already removed.
+/// - The caller must hold the node's lock (invariant now maintained
+///   for the full list-transfer lifecycle in `Drop`).
+fn remove_from_list(head: &mut Option<NonNull<DeathNotification>>, entry: NonNull<DeathNotification>) {
+    unsafe {
+        let e = entry.as_mut();
+        let prev = e.links.prev;
+        let next = e.links.next;
+
+        if let Some(p) = prev {
+            p.as_mut().links.next = next;
+        } else {
+            // Was head
+            *head = next;
+        }
+        if let Some(n) = next {
+            n.as_mut().links.prev = prev;
+        }
+    }
+}
+
+/// Process the temporary list. Runs *while the lock is still held*.
+fn process_death_notifications(mut head: Option<NonNull<DeathNotification>>) {
+    while let Some(node_ptr) = head {
+        unsafe {
+            let next = node_ptr.as_ref().links.next;
+            let node = &mut *node_ptr.as_ptr();
+            if let Some(cb) = node.callback.take() {
+                cb(node.id);
+            }
+            let _ = Box::from_raw(node_ptr.as_ptr());
+            head = next;
+        }
+    }
+}
+
+impl Drop for BinderNode {
+    fn drop(&mut self) {
+        let mut guard = self.inner.lock().unwrap();
+
+        // === CRITICAL: List transfer under lock ===
+        let mut temp_head = None;
+        std::mem::swap(&mut guard.death_list_head, &mut temp_head);
+        // ===========================================
+
+        // Process the temporary list *before* the guard drops.
+        // This maintains the synchronization invariant for the entire
+        // lifecycle of the moved list (no concurrent remove can interleave).
+        process_death_notifications(temp_head);
+
+        // Lock released only after processing completes.
+    }
+}
