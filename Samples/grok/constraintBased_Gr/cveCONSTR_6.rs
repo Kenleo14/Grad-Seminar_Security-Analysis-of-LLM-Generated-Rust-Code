@@ -1,179 +1,322 @@
-// Complete Rust module for a thread-safe intrusive linked list with a safe cleanup routine.
-// This implements the requirements exactly:
-// 1. Uses `unsafe` for all intrusive pointer manipulation (mimicking the style in rust_binder's death_list).
-// 2. The `release()` function moves items to a local collection (a "stack list" of pointers) to keep the critical section minimal.
-// 3. Avoids the exact race condition in CVE-2025-68260 (Node::release moving the list to a local stack list, then iterating it after dropping the lock, allowing concurrent `remove()` to corrupt prev/next pointers in a different list).
-// 4. Uses `std::sync::Mutex` (standard synchronization primitive; a spinlock could be substituted in no_std/kernel environments).
+//! Thread-safe Cleanup Routine for Intrusive Linked List in Rust
+//! 
+//! This module implements a **thread-safe intrusive doubly-linked list** for managing
+//! death notifications (modeled after Android Binder's `death_list` in `rust_binder`).
+//! 
+//! **Key Requirements Addressed**:
+//! 1. **Unsafe pointer manipulation** — All intrusive link operations (`insert`, `remove`, `pop_front`) use `unsafe` with `NonNull` and raw pointer arithmetic, exactly mimicking kernel-style `rust_binder` patterns.
+//! 2. **release() with local stack list** — To minimize lock contention, `release()` builds a temporary `Vec` of owned callbacks **entirely under the lock**. The lock is dropped only *after* the transfer is complete, before invoking callbacks.
+//! 3. **Avoid CVE-2025-68260 race** — The critical fix: **No list elements are exposed outside the lock**. 
+//!    - The CVE occurred because `mem::take` + `drop(guard)` + iterate temp list allowed concurrent `unsafe remove()` to mutate `prev`/`next` pointers while the temporary list still referenced the same objects.
+//!    - Here, `pop_front` transfers ownership **under lock**. Concurrent `remove()` either sees the element still in the list (and removes it safely) or never sees it (if already popped).
+//!    - **Synchronization invariant** (strictly maintained): 
+//!      > "A `DeathLink` is either exclusively in this `DeathList` (protected by the `Mutex`) **or** nowhere. Never in two places at once."
+//!      This invariant holds across the entire "move to local stack" because the move completes before the guard drops.
+//! 4. **Synchronization primitive** — Uses `std::sync::Mutex` for simplicity and portability. In a real kernel context, this would be `kernel::sync::Mutex` or a spinlock (`spin::Mutex`). Mutex is chosen here as it is "standard" and provides poisoning safety.
+//! 
+//! **Memory Stability & Concurrency Guarantees**:
+//! - All `prev`/`next` mutations happen **exclusively** while holding `&mut DeathList` (via `MutexGuard`).
+//! - `Arc<DeathRecipient>` ensures objects stay alive during transfer and callback execution.
+//! - `DeathRecipient::Drop` auto-unlinks (best-effort).
+//! - Callbacks run **without** the lock held → prevents deadlock if callbacks acquire other locks or perform blocking work.
+//! - Idempotent `release()`; handles node already dead.
+//! - Edge cases: empty list, concurrent link/unlink/release from many threads, callback panics (caught), double-unlink, unlink after death.
+//! 
+//! **Why this avoids the CVE aliasing violation**:
+//! - In the vulnerable pattern, after lock drop the temporary list provided a second alias to the intrusive objects' memory while another thread performed mutable pointer writes via `unsafe remove`.
+//! - Rust's aliasing rules (Stacked Borrows / Tree Borrows) were violated because there was no synchronization protecting the "moved" objects.
+//! - Here, the transfer (`pop_front` loop) is atomic w.r.t. other mutations. When the lock drops, the original list is empty and no dangling `prev`/`next` references remain accessible concurrently.
 
-use std::sync::Mutex;
-use std::ptr;
+use std::sync::{Arc, Mutex, Weak};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic;
 
-/// Poison values used after `list_del` (standard kernel-style defense against double-delete or use-after-free).
-const LIST_POISON1: *mut ListHead = 0x100 as *mut ListHead;
-const LIST_POISON2: *mut ListHead = 0x200 as *mut ListHead;
-
-/// Intrusive list head (embedded in user nodes). All manipulation is `unsafe` and mimics rust_binder.
+/// Intrusive link embedded directly in the payload (zero-allocation).
+#[derive(Default)]
 #[repr(C)]
-#[derive(Debug)]
-pub struct ListHead {
-    pub next: *mut ListHead,
-    pub prev: *mut ListHead,
+struct DeathLink {
+    next: Option<NonNull<DeathLink>>,
+    prev: Option<NonNull<DeathLink>>,
 }
 
-impl ListHead {
-    /// Constant for an uninitialized head (user must call `init` before use).
-    pub const fn uninit() -> Self {
-        ListHead {
-            next: ptr::null_mut(),
-            prev: ptr::null_mut(),
+/// Death callback (can be slow or re-entrant — hence we release the lock before calling).
+type DeathCallback = Box<dyn FnOnce() + Send + Sync>;
+
+/// Death recipient — the payload containing the intrusive link.
+struct DeathRecipient {
+    links: DeathLink,
+    callback: Option<DeathCallback>, // Option to allow take-once
+    node: Weak<BinderNode>,
+    is_linked: AtomicBool,
+}
+
+impl DeathRecipient {
+    fn new(callback: DeathCallback, node: Weak<BinderNode>) -> Arc<Self> {
+        Arc::new(DeathRecipient {
+            links: DeathLink::default(),
+            callback: Some(callback),
+            node,
+            is_linked: AtomicBool::new(false),
+        })
+    }
+}
+
+impl Drop for DeathRecipient {
+    fn drop(&mut self) {
+        // Best-effort auto-unlink when the recipient is dropped while still linked.
+        if let Some(node) = self.node.upgrade() {
+            let _ = node.unlink_to_death(Arc::from_raw(self as *const Self as *mut Self)); // Avoid double-drop
         }
     }
-
-    /// Initialize a list head as empty (circular sentinel).
-    pub unsafe fn init(head: *mut Self) {
-        let h = &mut *head;
-        h.next = head;
-        h.prev = head;
-    }
-
-    /// Returns true if the list is empty.
-    pub unsafe fn empty(head: *const Self) -> bool {
-        (*head).next == head as *mut _
-    }
 }
 
-/// Private unsafe helpers for intrusive operations (never exposed publicly).
-mod list_ops {
-    use super::*;
+/// Intrusive doubly-linked list head.
+struct DeathList {
+    head: Option<NonNull<DeathLink>>,
+    len: usize,
+}
 
-    pub unsafe fn add(new: *mut ListHead, head: *mut ListHead) {
-        let next = (*head).next;
-        (*new).next = next;
-        (*new).prev = head;
-        (*next).prev = new;
-        (*head).next = new;
+impl DeathList {
+    const fn new() -> Self {
+        DeathList { head: None, len: 0 }
     }
 
-    pub unsafe fn del(entry: *mut ListHead) {
-        let prev = (*entry).prev;
-        let next = (*entry).next;
-        (*next).prev = prev;
-        (*prev).next = next;
-        // Poison to make concurrent remove() a safe no-op (avoids CVE race).
-        (*entry).next = LIST_POISON1;
-        (*entry).prev = LIST_POISON2;
-    }
+    /// Insert at front under exclusive lock.
+    /// SAFETY: Caller must hold the `Mutex` exclusively.
+    unsafe fn insert_front(&mut self, recipient: &Arc<DeathRecipient>) {
+        let link_ptr = NonNull::from(&recipient.links as *const DeathLink as *mut DeathLink);
 
-    pub unsafe fn splice_init(list: *mut ListHead, head: *mut ListHead) {
-        if !super::ListHead::empty(list) {
-            let first = (*list).next;
-            let last = (*list).prev;
-            let at = (*head).next;
-            (*first).prev = head;
-            (*last).next = at;
-            (*at).prev = last;
-            (*head).next = first;
-            // Re-init source list to empty.
-            (*list).next = list;
-            (*list).prev = list;
+        if let Some(mut h) = self.head {
+            (*link_ptr.as_ptr()).next = Some(h);
+            (*h.as_ptr()).prev = Some(link_ptr);
+        } else {
+            (*link_ptr.as_ptr()).next = None;
         }
+        (*link_ptr.as_ptr()).prev = None;
+        self.head = Some(link_ptr);
+        self.len += 1;
+        recipient.is_linked.store(true, Ordering::Release);
     }
 
-    /// Helper to detect poisoned pointers (used in safe remove).
-    pub fn is_poisoned(p: *mut ListHead) -> bool {
-        p == LIST_POISON1 || p == LIST_POISON2
-    }
-}
+    /// Pop front and transfer ownership to caller.
+    /// Returns `None` if list empty.
+    /// SAFETY: Caller must hold the `Mutex` exclusively. The returned `Arc` takes ownership.
+    unsafe fn pop_front(&mut self) -> Option<Arc<DeathRecipient>> {
+        let link = self.head?;
+        let recipient_ptr = link.as_ptr() as *mut DeathRecipient;
 
-/// Thread-safe wrapper around the intrusive list.
-/// All public operations are synchronized; the lock is held only for pointer manipulation.
-pub struct ThreadSafeIntrusiveList {
-    inner: Mutex<ListHead>,
-}
+        // Increment strong count before from_raw to keep it alive.
+        Arc::increment_strong_count(recipient_ptr);
+        let recipient = Arc::from_raw(recipient_ptr);
 
-impl ThreadSafeIntrusiveList {
-    /// Creates a new empty thread-safe intrusive list.
-    pub fn new() -> Self {
-        let mut head = ListHead::uninit();
-        unsafe { ListHead::init(&mut head as *mut _) };
-        Self {
-            inner: Mutex::new(head),
+        let next = (*link.as_ptr()).next;
+
+        if let Some(mut n) = next {
+            (*n.as_ptr()).prev = None;
         }
+        self.head = next;
+
+        // Clear links — prevents any dangling pointer use after pop.
+        (*link.as_ptr()).next = None;
+        (*link.as_ptr()).prev = None;
+
+        self.len = self.len.saturating_sub(1);
+        recipient.is_linked.store(false, Ordering::Release);
+
+        Some(recipient)
     }
 
-    /// Inserts a node (unsafe because caller must guarantee the node is not already in a list and lives long enough).
-    pub unsafe fn insert(&self, new: *mut ListHead) {
+    /// Remove a specific recipient (for unlink_to_death).
+    /// SAFETY: Caller must hold the `Mutex` exclusively.
+    /// The "either in this list or nowhere" invariant is preserved.
+    unsafe fn remove(&mut self, recipient: &DeathRecipient) -> bool {
+        if !recipient.is_linked.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let link_ptr = NonNull::from(&recipient.links as *const DeathLink as *mut DeathLink);
+        let prev = (*link_ptr.as_ptr()).prev;
+        let next = (*link_ptr.as_ptr()).next;
+
+        if let Some(mut p) = prev {
+            (*p.as_ptr()).next = next;
+        } else {
+            self.head = next; // Was head
+        }
+
+        if let Some(mut n) = next {
+            (*n.as_ptr()).prev = prev;
+        }
+
+        // Clear to prevent reuse of stale pointers.
+        (*link_ptr.as_ptr()).next = None;
+        (*link_ptr.as_ptr()).prev = None;
+
+        self.len = self.len.saturating_sub(1);
+        recipient.is_linked.store(false, Ordering::Release);
+        true
+    }
+}
+
+/// Internal state protected by Mutex.
+struct NodeInner {
+    death_list: DeathList,
+    is_alive: bool,
+}
+
+/// The BinderNode — shared via Arc for thread-safe access.
+pub struct BinderNode {
+    inner: Mutex<NodeInner>,
+    id: u64, // For identification/debug
+}
+
+impl BinderNode {
+    /// Create a new node.
+    pub fn new(id: u64) -> Arc<Self> {
+        Arc::new(BinderNode {
+            inner: Mutex::new(NodeInner {
+                death_list: DeathList::new(),
+                is_alive: true,
+            }),
+            id,
+        })
+    }
+
+    /// Register a death notification (link_to_death).
+    pub fn link_to_death(
+        self: &Arc<Self>,
+        callback: impl FnOnce() + Send + Sync + 'static,
+    ) -> Option<Arc<DeathRecipient>> {
+        let node_weak = Arc::downgrade(self);
+        let recipient = DeathRecipient::new(Box::new(callback), node_weak);
+
         let mut guard = self.inner.lock().unwrap();
-        list_ops::add(new, &mut *guard as *mut ListHead);
-    }
-
-    /// Removes a node safely. This is the public safe wrapper around the unsafe list_del.
-    /// It acquires the lock and checks for poison (prevents corruption if called after release() has moved the item).
-    pub fn remove(&self, entry: *mut ListHead) {
-        let mut guard = self.inner.lock().unwrap();
-        unsafe {
-            if list_ops::is_poisoned((*entry).next) || list_ops::is_poisoned((*entry).prev) {
-                return; // Already removed (safe no-op, avoids CVE race).
+        if !guard.is_alive {
+            drop(guard);
+            // Fire immediately if node already dead.
+            if let Some(cb) = recipient.callback.take() {
+                let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| cb()));
             }
-            list_ops::del(entry);
+            return None;
         }
+
+        unsafe {
+            guard.death_list.insert_front(&recipient);
+        }
+        Some(recipient)
     }
 
-    /// CRITICAL: The cleanup routine.
-    /// Moves all items to a local collection (the "stack list" of pointers) while holding the lock.
-    /// The lock is dropped immediately after the move, minimizing contention time.
-    /// Each node is explicitly unlinked + poisoned under the lock.
-    /// Concurrent `remove()` calls become safe no-ops due to poison checks.
-    /// This completely eliminates the CVE-2025-68260 race (no temporary linked list whose pointers can be corrupted by concurrent remove after lock drop).
-    pub fn release<F>(&self, mut cleanup: F)
-    where
-        F: FnMut(*mut ListHead),
-    {
-        let mut local_items: Vec<*mut ListHead> = Vec::new();
+    /// Unlink a previously registered recipient.
+    pub fn unlink_to_death(&self, recipient: &Arc<DeathRecipient>) -> bool {
+        let mut guard = self.inner.lock().unwrap();
+        if !guard.is_alive {
+            return false;
+        }
+        unsafe { guard.death_list.remove(recipient) }
+    }
 
-        // Critical section: O(n) pointer work only (fast), no slow cleanup here.
+    /// Release the node — trigger death notifications.
+    /// 
+    /// **Critical CVE fix**: Build the local callback list **entirely under the lock**.
+    /// Lock is dropped only after all intrusive pointers have been cleared and ownership transferred.
+    /// This ensures `prev`/`next` remain valid and synchronized even if `unlink_to_death` runs concurrently.
+    pub fn release(self: Arc<Self>) {
+        let mut callbacks: Vec<DeathCallback> = Vec::new();
+
         {
             let mut guard = self.inner.lock().unwrap();
-            let head = &mut *guard as *mut ListHead;
-            unsafe {
-                while !ListHead::empty(head) {
-                    let entry = (*head).next;
-                    list_ops::del(entry); // Unlink from global + poison.
-                    local_items.push(entry);
-                }
-            }
-        } // Lock dropped here — contention minimized.
 
-        // Process the local collection outside the lock (slow cleanup allowed).
-        for entry in local_items {
-            cleanup(entry);
+            if !guard.is_alive {
+                return; // Idempotent release.
+            }
+            guard.is_alive = false;
+
+            // Transfer all items to local stack vec while holding the lock.
+            // This is the safe "move to local list" — no exposure of elements outside lock.
+            while let Some(recipient) = unsafe { guard.death_list.pop_front() } {
+                if let Some(cb) = recipient.callback.take() {
+                    callbacks.push(cb);
+                }
+                // recipient drops here if no other strong refs, but callback is moved out.
+            }
+            // At this point: death_list is empty, all links cleared, invariant holds.
+        } // MutexGuard dropped here — lock released with short hold time.
+
+        // Invoke callbacks WITHOUT holding the lock (minimizes contention, avoids deadlock).
+        for cb in callbacks {
+            let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| cb()));
         }
     }
 
-    /// Returns whether the list is empty (cheap peek under lock).
-    pub fn is_empty(&self) -> bool {
-        let guard = self.inner.lock().unwrap();
-        unsafe { ListHead::empty(&*guard as *const ListHead) }
+    /// Query liveness (for testing/debug).
+    pub fn is_alive(&self) -> bool {
+        self.inner.lock().unwrap().is_alive
     }
 }
 
-// Example usage (for completeness; not part of the public API).
-// struct MyNode {
-//     link: ListHead,
-//     data: u32,
-// }
-//
-// impl MyNode {
-//     fn new(data: u32) -> Self { ... }
-//     fn release(self) { println!("Releasing node with data {}", self.data); }
-// }
-//
-// let list = ThreadSafeIntrusiveList::new();
-// let mut node = MyNode::new(42);
-// unsafe { list.insert(&mut node.link as *mut _); }
-//
-// list.release(|entry| {
-//     // Reconstruct containing node (container_of pattern in real code).
-//     let node = unsafe { &mut *container_of!(entry, MyNode, link) };
-//     node.release(); // Or drop, decrement refcount, etc.
-// });
+/// Example usage and concurrency test.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    #[test]
+    fn test_release_with_local_stack_and_concurrent_unlink() {
+        let node = BinderNode::new(1);
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        // Register multiple recipients
+        let mut recipients = vec![];
+        for i in 0..10 {
+            let c = Arc::clone(&call_count);
+            let rec = node.link_to_death(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }).unwrap();
+            recipients.push(rec);
+        }
+
+        // Concurrent unlink from one recipient while releasing
+        let node_clone = Arc::clone(&node);
+        let unlink_handle = thread::spawn(move || {
+            if let Some(rec) = recipients.get(3) {
+                let _ = node_clone.unlink_to_death(rec);
+            }
+        });
+
+        // Release — should deliver remaining 9 callbacks (one unlinked)
+        node.release();
+
+        unlink_handle.join().unwrap();
+
+        assert!(!node.is_alive());
+        // Expect 9 callbacks (one was unlinked before release completed)
+        assert_eq!(call_count.load(Ordering::SeqCst), 9);
+    }
+
+    #[test]
+    fn test_multiple_concurrent_releases() {
+        let node = BinderNode::new(2);
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..5 {
+            let c = Arc::clone(&call_count);
+            let _ = node.link_to_death(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        let handles: Vec<_> = (0..3).map(|_| {
+            let n = Arc::clone(&node);
+            thread::spawn(move || n.release())
+        }).collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(!node.is_alive());
+        assert_eq!(call_count.load(Ordering::SeqCst), 5); // Only once
+    }
+}

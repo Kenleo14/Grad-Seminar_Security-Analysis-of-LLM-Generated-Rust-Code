@@ -1,110 +1,208 @@
-//! # Fixed rust_binder Node Death-List Handling (CVE-2025-68260)
-//!
-//! This module contains the **post-fix** implementation of `Node::release`
-//! for the Rust Android Binder driver.
-//!
-//! ## CVE-2025-68260 Summary (First Rust CVE in Linux)
-//! - **Root cause**: In `Node::release`, `core::mem::take` moved the entire
-//!   intrusive `death_list` to a stack temporary, the lock was dropped,
-//!   and the temporary list was iterated unlocked.
-//! - **Unsafe violation**: Concurrent `node_inner.death_list.remove(...)`
-//!   (with SAFETY comment assuming "this list or none") raced on the
-//!   embedded `prev`/`next` pointers now owned by the *stack* list.
-//! - **Aliasing rules broken**: Two different `List` instances had overlapping
-//!   mutable access to the same intrusive links → data race / UB.
-//! - **Manifestation**: Kernel oops (DoS) via corrupted list pointers.
-//! - **Fix strategy**: Pop elements *one-by-one from the original list* under
-//!   the lock, process unlocked, reacquire only for the next pop.
-//!   This keeps the synchronization invariant alive for the *entire*
-//!   lifecycle of every list element transfer.
-//!
-//! The `oneway_todo` path already used this safe per-item pattern;
-//! `death_list` now matches it exactly.
-//!
-//! ## Why this maintains Rust's aliasing & synchronization invariants
-//! - The *canonical* `death_list` instance remains the sole owner of
-//!   every `NodeDeath`'s links at all times.
-//! - No second `List` ever exists while the lock is dropped.
-//! - Every mutation of the list (pop/remove) happens while the lock
-//!   is held; processing happens only after the element has been
-//!   exclusively removed.
-//! - No data race on `prev`/`next` fields is possible.
-//!
-//! Edge cases covered:
-//! - Empty list → immediate return.
-//! - Single element → one lock release/reacquire.
-//! - Long list under contention → lock is released promptly after each pop.
-//! - Nested callbacks in `set_dead` → cannot deadlock (lock not held).
-//! - Concurrent registration/unregistration → fully serialized by the mutex.
+//! Fixed Rust Binder Node management with death notifications.
+//! Addresses CVE-2025-68260 by maintaining exclusive access invariants
+//! across the entire drain + temporary list transfer.
 
-#![no_std]
-#![allow(unused)] // For illustration; real kernel code has full context
+use parking_lot::Mutex;
+use std::collections::LinkedList;
+use std::ptr::NonNull;
+use std::sync::Arc;
 
-use kernel::prelude::*;
-use kernel::sync::MutexGuard;
-use kernel::linked_list::List; // kernel's intrusive List
+/// Death callback (Send + Sync for thread safety).
+type DeathCallback = Box<dyn Fn() + Send + Sync>;
 
-/// Minimal illustration of the types involved (real kernel code has more fields).
-pub struct NodeInner {
-    pub oneway_todo: List<Arc<WorkItem>>, // simplified
-    pub death_list: List<Arc<NodeDeath>>,
+#[repr(C)]
+#[derive(Default)]
+struct DeathLinks {
+    next: Option<NonNull<DeathNotification>>,
+    prev: Option<NonNull<DeathNotification>>,
 }
 
-pub struct Node {
-    pub owner: Arc<Process>, // owns the inner mutex
-    pub inner: /* ... some guarded inner accessor ... */,
+struct DeathNotification {
+    callback: DeathCallback,
+    links: DeathLinks,
+    /// Strong back-ref to node inner for safe unlinking.
+    node_inner: Arc<Mutex<NodeInner>>,
+    /// Flag to help detect if this notification has been drained/released.
+    /// In a more optimized kernel version this might be a generation or removed flag.
+    is_drained: bool, // Set only by the drainer under lock
 }
 
-/// Placeholder for real kernel types.
-pub struct Process {
-    inner: Mutex<NodeInner>,
-}
-pub struct WorkItem;
-pub struct NodeDeath;
-
-impl NodeDeath {
-    pub fn into_arc(self) -> Arc<Self> { todo!("real impl") }
-    pub fn set_dead(self: Arc<Self>) { /* notify clients */ }
-}
-
-impl WorkItem {
-    pub fn into_arc(self) -> Arc<Self> { todo!("real impl") }
-    pub fn cancel(self: Arc<Self>) { /* cancel work */ }
-}
-
-impl Node {
-    /// Fixed `release` – maintains lock-protected list invariant for the
-    /// entire transfer lifecycle.
-    pub(crate) fn release(&self) {
-        let mut guard = self.owner.inner.lock();
-
-        // First drain oneway_todo (already used the safe pattern pre-CVE)
-        while let Some(work) = self.inner.access_mut(&mut guard).oneway_todo.pop_front() {
-            // Release lock before potentially long-running work
-            drop(guard);
-            work.into_arc().cancel();
-            // Reacquire for the next item
-            guard = self.owner.inner.lock();
+impl DeathNotification {
+    fn new(callback: DeathCallback, node_inner: Arc<Mutex<NodeInner>>) -> Self {
+        DeathNotification {
+            callback,
+            links: DeathLinks::default(),
+            node_inner,
+            is_drained: false,
         }
-
-        // Fixed death_list path – the actual CVE fix.
-        // We pop one element at a time from the *original* list while the
-        // lock is held. This guarantees:
-        // 1. The intrusive links are never owned by a second List.
-        // 2. No concurrent remove can touch the same prev/next pointers.
-        // 3. The SAFETY contract on List::remove remains valid everywhere.
-        while let Some(death) = self.inner.access_mut(&mut guard).death_list.pop_front() {
-            // Element is now exclusively removed from the canonical list.
-            // Lock can safely be dropped for processing.
-            drop(guard);
-            death.into_arc().set_dead();
-            // Reacquire only for the next pop (or exit if list empty).
-            guard = self.owner.inner.lock();
-        }
-        // Lock is dropped automatically when `guard` goes out of scope.
     }
 }
 
-// In real kernel code this would live in drivers/android/binder/node.rs
-// The patch that landed in stable (3e0ae02ba831) is exactly this change
-// for the death_list loop.
+struct NodeInner {
+    death_list_head: Option<NonNull<DeathNotification>>,
+    is_released: bool,
+}
+
+impl NodeInner {
+    fn new() -> Self {
+        NodeInner {
+            death_list_head: None,
+            is_released: false,
+        }
+    }
+
+    // Insert remains similar (O(1), under lock)
+    unsafe fn insert_death(&mut self, notif: NonNull<DeathNotification>) {
+        let notif_mut = notif.as_ptr().as_mut().unwrap();
+        notif_mut.links.next = self.death_list_head;
+        notif_mut.links.prev = None;
+
+        if let Some(mut head) = self.death_list_head {
+            head.as_mut().links.prev = Some(notif);
+        }
+        self.death_list_head = Some(notif);
+    }
+
+    // Remove under lock with invariant check
+    unsafe fn remove_death(&mut self, notif: NonNull<DeathNotification>) -> bool {
+        let notif_ref = notif.as_ref();
+        if notif_ref.is_drained {
+            return false; // Already drained by release — ignore
+        }
+
+        // Rewire links
+        if let Some(prev) = notif_ref.links.prev {
+            prev.as_mut().links.next = notif_ref.links.next;
+        } else {
+            self.death_list_head = notif_ref.links.next;
+        }
+        if let Some(next) = notif_ref.links.next {
+            next.as_mut().links.prev = notif_ref.links.prev;
+        }
+
+        let notif_mut = notif.as_ptr().as_mut().unwrap();
+        notif_mut.links.next = None;
+        notif_mut.links.prev = None;
+        true
+    }
+
+    // Drain: exclusive ownership transfer under lock
+    fn drain_deaths(&mut self) -> LinkedList<Box<DeathNotification>> {
+        let mut temp = LinkedList::new();
+        let mut current = self.death_list_head;
+        self.death_list_head = None;
+
+        while let Some(ptr) = current {
+            let mut boxed = unsafe { Box::from_raw(ptr.as_ptr()) };
+            boxed.is_drained = true; // Mark as exclusively owned now
+
+            // Clear links (already unlinked via bulk drain)
+            boxed.links.next = None;
+            boxed.links.prev = None;
+
+            temp.push_back(boxed);
+
+            current = unsafe { (*ptr.as_ptr()).links.next }; // safe because we control the list
+        }
+        temp
+    }
+}
+
+#[derive(Clone)]
+pub struct BinderNode {
+    inner: Arc<Mutex<NodeInner>>,
+}
+
+impl BinderNode {
+    pub fn new() -> Self {
+        BinderNode {
+            inner: Arc::new(Mutex::new(NodeInner::new())),
+        }
+    }
+
+    pub fn link_to_death<F>(&self, callback: F) -> bool
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let mut guard = self.inner.lock();
+        if guard.is_released {
+            return false;
+        }
+
+        let notif = Box::new(DeathNotification::new(
+            Box::new(callback),
+            Arc::clone(&self.inner),
+        ));
+        let ptr = NonNull::from(Box::leak(notif));
+
+        unsafe {
+            guard.insert_death(ptr);
+        }
+        true
+    }
+
+    /// Fixed unlink: always under lock, respects released/drained state
+    pub fn unlink_to_death(&self) -> bool {
+        // In real code you'd pass a cookie/identifier; here simplified to demo logic.
+        // For full version, store a handle with NonNull or Weak.
+        let mut guard = self.inner.lock();
+        if guard.is_released {
+            return false;
+        }
+
+        // Traverse and remove first matching (demo)
+        let mut current = guard.death_list_head;
+        while let Some(ptr) = current {
+            let notif_ref = unsafe { ptr.as_ref() };
+            if !notif_ref.is_drained {
+                unsafe {
+                    if guard.remove_death(ptr) {
+                        let _ = unsafe { Box::from_raw(ptr.as_ptr()) };
+                        return true;
+                    }
+                }
+            }
+            current = notif_ref.links.next;
+        }
+        false
+    }
+
+    /// Fixed release: drain under lock, mark released, then process temp list.
+    /// The key: is_released + is_drained prevents any concurrent remove from
+    /// touching the links after drain begins. The invariant holds for the entire
+    /// lifecycle of the transfer.
+    pub fn release(&self) {
+        let temp_list = {
+            let mut guard = self.inner.lock();
+
+            if guard.is_released {
+                return;
+            }
+            guard.is_released = true;
+
+            // Drain happens with exclusive lock — no other thread can modify links
+            guard.drain_deaths()
+        }; // Lock dropped here — safe because drained notifications are marked and unlinked
+
+        // Process callbacks lock-free (performance critical)
+        for notif in temp_list {
+            (notif.callback)();
+            // Drop happens here — exclusive ownership guaranteed
+        }
+    }
+
+    pub fn is_released(&self) -> bool {
+        self.inner.lock().is_released
+    }
+}
+
+impl Drop for BinderNode {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) == 1 {
+            self.release();
+        }
+    }
+}
+
+// Tests would demonstrate no races, proper delivery, and safe concurrent unlink/release.
+// In practice, add stress tests with many threads performing link/unlink/release.
