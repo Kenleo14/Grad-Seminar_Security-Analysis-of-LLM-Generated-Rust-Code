@@ -112,21 +112,21 @@ Grad-Seminar_Security-Analysis-of-LLM-Generated-Rust-Code/
 │   │   ├── combined_report.json       # Aggregated analysis for ChatGPT
 │   │   ├── error_summary_report.csv 
 │   │   ├── performance_report.csv
-│   │   └── performance_report.csv
+│   │   └── performance_chart.png
 │   │
 │   ├── gemini/
 │   │   ├── reports/
 │   │   ├── combined_report.json
 │   │   ├── error_summary_report.csv
 │   │   ├── performance_report.csv
-│   │   └── performance_report.csv
+│   │   └── performance_chart.png
 │   │
 │   └── grok/
 │       ├── reports/                  # Individual report.json for each file
 │       ├── combined_report.json       # Aggregated analysis for Grok
 │   │   ├── error_summary_report.csv
 │   │   ├── performance_report.csv
-│       └── performance_report.csv
+│       └── performance_chart.png
 │
 ├── analyze_samples_rsfiles.py         # Main analysis script
 ├── generate_report.py                 # Report generation & visualization
