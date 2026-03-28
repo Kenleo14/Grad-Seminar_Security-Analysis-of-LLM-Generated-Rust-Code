@@ -71,11 +71,8 @@ def main():
         else:
             strategy = 'Unknown'
 
-        # Stage 4 Logic: Success = No heuristic "hits" found for CVE patterns
         cve_manual = file_data.get('cve_2025_68260_manual', {})
         cve_summary = cve_manual.get('summary', {})
-        # Success if all monitored counts (unsafe, syscalls, etc) are 0
-        stage4_success = all(count == 0 for count in cve_summary.values()) if cve_summary else False
 
         # Extract success booleans
         s1_ok = file_data.get('rustc_compile', {}).get('ok', False)
@@ -88,6 +85,8 @@ def main():
         codeql_finding_count, codeql_rule_ids = _load_sarif(sarif_path)
         codeql_findings_str = ", ".join(codeql_rule_ids) if codeql_rule_ids else ("none" if s3_ok else "")
 
+        unsafe_count = cve_summary.get('unsafe', 0)
+
         records.append({
             'Strategy': strategy,
             'File': source,
@@ -96,7 +95,7 @@ def main():
             'Station 2: Idiomatic (cargo clippy)': s2_clippy_ok,
             'Station 3: Security Audit (CodeQL)': s3_ok,
             'Station 3: CodeQL Findings': codeql_finding_count,
-            'Station 4: CVE Mitigation (Heuristic)': stage4_success
+            'Station 4: Unsafe Block Count': unsafe_count,
         })
 
         # Capture Error Details
@@ -117,7 +116,7 @@ def main():
             'S2 Clippy Issue': file_data.get('clippy', {}).get('stderr', '').strip() if not s2_clippy_ok else '',
             'S3 CodeQL Issue': s3_issue,
             'S3 CodeQL Findings': codeql_findings_str,
-            'S4 Heuristic Hits': str(cve_summary) if not stage4_success else ''
+            'S4 Heuristic Hits': str(cve_summary) if any(cve_summary.values()) else ''
         })
 
     df = pd.DataFrame(records)
@@ -131,7 +130,7 @@ def main():
         Stage2_clippy=('Station 2: Idiomatic (cargo clippy)', 'sum'),
         Stage3_CodeQL_Pass=('Station 3: Security Audit (CodeQL)', 'sum'),
         Stage3_CodeQL_Findings=('Station 3: CodeQL Findings', 'sum'),
-        Stage4_CVE_Heuristic=('Station 4: CVE Mitigation (Heuristic)', 'sum')
+        Stage4_Unsafe_Count=('Station 4: Unsafe Block Count', 'sum'),
     )
     perf_csv = output_dir / "performance_report.csv"
     perf_summary.to_csv(perf_csv)
@@ -142,28 +141,63 @@ def main():
     err_df.to_csv(error_csv, index=False)
     print(f"✅ Error details saved to: {error_csv}")
 
-    # 4. Visualization
-    plot_df = perf_summary.drop(columns=['Total_Samples', 'Stage3_CodeQL_Findings']).reset_index()
-    melted_df = plot_df.melt(id_vars='Strategy', var_name='Metric', value_name='Success Count')
-
+    # 4. Visualization — two subplots (different Y-axis scales)
     sns.set_theme(style="whitegrid")
-    plt.figure(figsize=(12, 7))
-    stage_palette = ["#2196F3", "#4CAF50", "#FF9800", "#F44336", "#9C27B0"]
-    ax = sns.barplot(data=melted_df, x='Strategy', y='Success Count', hue='Metric', palette=stage_palette)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 11))
+    fig.suptitle('LLM Performance by Prompting Strategy', fontsize=15, fontweight='bold', y=0.98)
 
-    plt.title('LLM Performance by Prompting Strategy (Raw Success Counts)', fontsize=14, pad=15)
-    plt.ylabel('Number of Successful Samples', fontsize=12)
-    plt.ylim(0, perf_summary['Total_Samples'].max() + 2)
-    plt.legend(title='Evaluation Stage', bbox_to_anchor=(1.05, 1), loc='upper left')
+    # --- Subplot 1: Pass/fail counts (Stage 1–3) ---
+    pass_cols = ['Stage1_rustc', 'Stage2_check', 'Stage2_clippy', 'Stage3_CodeQL_Pass']
+    pass_labels = {
+        'Stage1_rustc':        'S1: Raw Compile (rustc)',
+        'Stage2_check':        'S2: Project Compile (cargo check)',
+        'Stage2_clippy':       'S2: Idiomatic (cargo clippy)',
+        'Stage3_CodeQL_Pass':  'S3: CodeQL Pass',
+    }
+    pass_df = perf_summary[pass_cols].rename(columns=pass_labels).reset_index()
+    melted_pass = pass_df.melt(id_vars='Strategy', var_name='Stage', value_name='Samples Passing')
 
-    for p in ax.patches:
+    palette1 = ["#2196F3", "#4CAF50", "#FF9800", "#9C27B0"]
+    sns.barplot(data=melted_pass, x='Strategy', y='Samples Passing',
+                hue='Stage', palette=palette1, ax=ax1)
+    ax1.set_title('Compilation & Static Analysis — Pass Counts', fontsize=12)
+    ax1.set_ylabel('Number of Samples Passing', fontsize=11)
+    ax1.set_xlabel('')
+    ax1.set_ylim(0, perf_summary['Total_Samples'].max() + 2)
+    ax1.legend(title='Evaluation Stage', bbox_to_anchor=(1.01, 1), loc='upper left', fontsize=9)
+    for p in ax1.patches:
         if p.get_height() > 0:
-            ax.annotate(f'{int(p.get_height())}', (p.get_x() + p.get_width() / 2., p.get_height()),
-                        ha='center', va='bottom', fontsize=9, xytext=(0, 3), textcoords='offset points')
+            ax1.annotate(f'{int(p.get_height())}',
+                         (p.get_x() + p.get_width() / 2., p.get_height()),
+                         ha='center', va='bottom', fontsize=9, xytext=(0, 3),
+                         textcoords='offset points')
+
+    # --- Subplot 2: Count metrics (CodeQL findings + unsafe block count) ---
+    count_cols = ['Stage3_CodeQL_Findings', 'Stage4_Unsafe_Count']
+    count_labels = {
+        'Stage3_CodeQL_Findings': 'S3: CodeQL Security Findings',
+        'Stage4_Unsafe_Count':    'S4: Unsafe Block Count',
+    }
+    count_df = perf_summary[count_cols].rename(columns=count_labels).reset_index()
+    melted_count = count_df.melt(id_vars='Strategy', var_name='Metric', value_name='Count')
+
+    palette2 = ["#F44336", "#FF9800"]
+    sns.barplot(data=melted_count, x='Strategy', y='Count',
+                hue='Metric', palette=palette2, ax=ax2)
+    ax2.set_title('Security Metrics — Counts per Strategy', fontsize=12)
+    ax2.set_ylabel('Count (summed across samples)', fontsize=11)
+    ax2.set_xlabel('Prompting Strategy', fontsize=11)
+    ax2.legend(title='Metric', bbox_to_anchor=(1.01, 1), loc='upper left', fontsize=9)
+    for p in ax2.patches:
+        if p.get_height() > 0:
+            ax2.annotate(f'{int(p.get_height())}',
+                         (p.get_x() + p.get_width() / 2., p.get_height()),
+                         ha='center', va='bottom', fontsize=9, xytext=(0, 3),
+                         textcoords='offset points')
 
     chart_path = output_dir / "performance_chart.png"
     plt.tight_layout()
-    plt.savefig(chart_path, dpi=300)
+    plt.savefig(chart_path, dpi=300, bbox_inches='tight')
     print(f"✅ Visualization saved to: {chart_path}")
 
 if __name__ == "__main__":

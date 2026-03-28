@@ -1,0 +1,4 @@
+Strategy        , Total_Samples, Stage1_rustc, Stage2_check, Stage2_clippy, Stage3_CodeQL_Pass, Stage3_CodeQL_Findings, Stage4_Unsafe_Count
+Chain-of-Thought,            10,            0,            1,             0,                  1,                      0,                  72
+Constraint-Based,            10,            0,            1,             0,                  1,                      0,                  87
+Zero-Shot       ,            10,            0,            2,             0,                  2,                      0,                  71
