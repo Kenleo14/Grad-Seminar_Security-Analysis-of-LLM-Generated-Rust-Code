@@ -253,7 +253,7 @@ def run_cargo_steps_for_rsfile(
         return deps, check, clippy, test_res
     
 
-def codeql_on_rsfile(rs_file: Path, out_dir: Path, timeout_s: int, query_suite: str) -> StepResult:
+def codeql_on_rsfile(rs_file: Path, out_dir: Path, timeout_s: int, query_suite: list[str]) -> StepResult:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # BUG FIX 1: Resolve to absolute paths BEFORE entering the temp dir.
@@ -294,7 +294,7 @@ def codeql_on_rsfile(rs_file: Path, out_dir: Path, timeout_s: int, query_suite: 
                 "database",
                 "analyze",
                 str(db_dir),
-                query_suite,
+                *[str(Path(s).resolve()) for s in query_suite],
                 "--format=sarifv2.1.0",
                 f"--output={sarif}",
                 "--threads=1",
@@ -319,7 +319,7 @@ def analyze_file(rs_file: Path, args: argparse.Namespace) -> FileReport:
 
     codeql_res = None
     if args.run_codeql:
-        if not args.codeql_suite:
+        if not args.codeql_suite:  # empty list
             codeql_res = StepResult(
                 ok=False,
                 cmd=["codeql", "database", "analyze", "<db>", "<suite>"],
@@ -346,7 +346,7 @@ def analyze_file(rs_file: Path, args: argparse.Namespace) -> FileReport:
                 rs_file=rs_file,
                 out_dir=per_file_out,
                 timeout_s=args.timeout,
-                query_suite=args.codeql_suite,
+                query_suite=args.codeql_suite,  # list[str]
             )
 
     manual = manual_cve_2025_68260_scan_rsfile(rs_file)
@@ -376,7 +376,8 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=900, help="Timeout per command in seconds (default: 900)")
     ap.add_argument("--run-tests", action="store_true", help="Run cargo test per sample (slower)")
     ap.add_argument("--run-codeql", action="store_true", help="Enable CodeQL (requires codeql CLI)")
-    ap.add_argument("--codeql-suite", default="", help="CodeQL suite (.qls path or pack reference). Required if --run-codeql.")
+    ap.add_argument("--codeql-suite", action="append", default=[], metavar="SUITE",
+                    help="CodeQL suite (.qls path or pack reference). Repeat to run multiple suites. Required if --run-codeql.")
     ap.add_argument(
         "--clippy-deny-warnings",
         action="store_true",

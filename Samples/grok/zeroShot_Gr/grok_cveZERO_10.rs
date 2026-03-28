@@ -1,153 +1,335 @@
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, AtomicUsize, atomic::{AtomicPtr, Ordering}};
+use std::ptr::{NonNull, null_mut};
+use std::cell::UnsafeCell;
+use std::mem;
 
-/// User-provided death recipient. Must be thread-safe and 'static.
-pub trait DeathRecipient: Send + Sync + 'static {
-    fn notify_death(&self);
+// Core trait for death recipients
+pub trait DeathRecipient: Send + Sync {
+    fn notify(&self, cookie: u64);
 }
 
-/// Intrusive node that lives inside the death-notification list.
-/// Links are embedded (intrusive) and the recipient is owned by this node.
-struct DeathNode {
-    next: Option<NonNull<DeathNode>>,
-    prev: Option<NonNull<DeathNode>>,
-    recipient: Box<dyn DeathRecipient>,
+// Intrusive link structure for doubly-linked lists (POD-like for safety)
+#[repr(C)]
+#[derive(Default)]
+struct Link {
+    next: Option<NonNull<Link>>,
+    prev: Option<NonNull<Link>>,
 }
 
-/// Intrusive doubly-linked list of death notifications.
-/// Only the head pointer is stored; the rest lives inside the nodes.
-struct DeathList {
-    head: Option<NonNull<DeathNode>>,
+// NodeLink specifically typed for BinderNode
+type NodeLink = Link;
+
+// DeathLink specifically typed for DeathEntry
+type DeathLink = Link;
+
+// DeathEntry with intrusive link
+pub struct DeathEntry {
+    link: UnsafeCell<DeathLink>,
+    cookie: u64,
+    recipient: Arc<dyn DeathRecipient>,
 }
 
-impl DeathList {
-    fn new() -> Self {
-        Self { head: None }
-    }
+unsafe impl Send for DeathEntry {}
+unsafe impl Sync for DeathEntry {}
 
-    /// Add a new death notification (intrusive insert at front).
-    fn add(&mut self, recipient: Box<dyn DeathRecipient>) {
-        let mut node = Box::new(DeathNode {
-            next: None,
-            prev: None,
-            recipient,
-        });
-        let node_ptr = NonNull::new(Box::leak(node)).expect("Box::leak never returns null");
-
-        unsafe {
-            let node_mut = node_ptr.as_mut();
-            node_mut.next = self.head;
-            node_mut.prev = None;
-
-            if let Some(mut old_head) = self.head {
-                old_head.as_mut().prev = Some(node_ptr);
-            }
-            self.head = Some(node_ptr);
-        }
-    }
-
-    /// Extract the entire list (moves nodes to a temporary list for cleanup).
-    /// After this call the list is empty.
-    fn take(&mut self) -> Option<NonNull<DeathNode>> {
-        let head = self.head;
-        self.head = None;
-        head
-    }
-}
-
-impl DeathList {
-    /// Cleanup a temporary list **outside any lock**.
-    /// Traverses the intrusive chain, notifies each recipient, then reclaims ownership
-    /// and drops the node. Memory stability is guaranteed because:
-    /// - We read `next` *before* calling `Box::from_raw`.
-    /// - The original list head was already taken, so no other thread can reach these nodes.
-    fn cleanup(mut head: Option<NonNull<DeathNode>>) {
-        while let Some(ptr) = head {
-            unsafe {
-                // Read next pointer while the memory is still valid.
-                let next = ptr.as_ref().next;
-
-                // Reclaim exact ownership that was leaked during `add`.
-                let node_box = Box::from_raw(ptr.as_ptr());
-
-                // Perform the death notification (may run arbitrary user code).
-                node_box.recipient.notify_death();
-
-                // `node_box` drops here → recipient is dropped, memory freed.
-                head = next;
-            }
-        }
-    }
-}
-
-/// Internal state protected by Arc + Mutex + Atomic.
-struct InnerNode {
-    death_notifications: Mutex<DeathList>,
-    released: AtomicBool,
-}
-
-impl InnerNode {
-    fn new() -> Self {
+impl DeathEntry {
+    fn new(recipient: Arc<dyn DeathRecipient>, cookie: u64) -> Self {
         Self {
-            death_notifications: Mutex::new(DeathList::new()),
-            released: AtomicBool::new(false),
+            link: UnsafeCell::new(Link::default()),
+            cookie,
+            recipient,
         }
+    }
+
+    // Unsafe accessors (used only under locks)
+    unsafe fn link_mut(&mut self) -> &mut DeathLink {
+        &mut *self.link.get()
+    }
+
+    unsafe fn link(&self) -> &DeathLink {
+        &*self.link.get()
     }
 }
 
-/// Public BinderNode handle – the main API users interact with.
-pub struct BinderNode {
-    inner: Arc<InnerNode>,
+// Handle for DeathEntry (RAII release/unlink)
+pub struct DeathHandle {
+    ptr: NonNull<DeathEntry>,
+    node_ptr: NonNull<BinderNode>,
 }
+
+impl Drop for DeathHandle {
+    fn drop(&mut self) {
+        self.unlink();
+    }
+}
+
+impl DeathHandle {
+    pub fn unlink(&mut self) {
+        let node = unsafe { self.node_ptr.as_ref() };
+        let _guard = node.death_lock.lock().unwrap();
+        let entry = unsafe { self.ptr.as_mut() };
+        Self::remove_from_list(&mut node.death_head.get(), entry);
+    }
+
+    unsafe fn remove_from_list(head_ptr: *mut Option<NonNull<DeathEntry>>, entry: &mut DeathEntry) {
+        let link = entry.link_mut();
+        if let Some(next) = link.next {
+            (*next.as_ptr() as *mut DeathEntry).link_mut().prev = link.prev;
+        }
+        if let Some(prev) = link.prev {
+            (*prev.as_ptr() as *mut DeathEntry).link_mut().next = link.next;
+        } else {
+            // Was head
+            *head_ptr = link.next;
+        }
+        link.next = None;
+        link.prev = None;
+    }
+}
+
+// Main BinderNode structure
+struct BinderNode {
+    // Intrusive link for manager's live/dead lists
+    node_link: UnsafeCell<NodeLink>,
+    // Death notifications intrusive list head
+    death_head: UnsafeCell<Option<NonNull<DeathEntry>>>,
+    // Lock protecting death list mutations and traversal
+    death_lock: Mutex<()>,
+    // Reference counts
+    strong_refs: AtomicUsize,
+    weak_refs: AtomicUsize,
+    // Backlink to manager
+    manager: Arc<NodeManager>,
+    // Represented object pointer (simplified)
+    object_ptr: *mut (),
+}
+
+unsafe impl Send for BinderNode {}
+unsafe impl Sync for BinderNode {}
 
 impl BinderNode {
-    /// Create a new Binder node.
-    pub fn new() -> Self {
+    fn new(manager: Arc<NodeManager>, object_ptr: *mut ()) -> Self {
         Self {
-            inner: Arc::new(InnerNode::new()),
+            node_link: UnsafeCell::new(NodeLink::default()),
+            death_head: UnsafeCell::new(None),
+            death_lock: Mutex::new(()),
+            strong_refs: AtomicUsize::new(1), // Initial strong ref
+            weak_refs: AtomicUsize::new(0),
+            manager,
+            object_ptr,
         }
     }
 
-    /// Register a death notification. Thread-safe; can be called concurrently
-    /// with `release()` (the race is handled safely inside `release`).
-    pub fn register_death_notification(&self, recipient: Box<dyn DeathRecipient>) {
-        let mut list = self.inner.death_notifications.lock().unwrap();
-        list.add(recipient);
+    unsafe fn node_link_mut(&mut self) -> &mut NodeLink {
+        &mut *self.node_link.get()
     }
 
-    /// Release the node (simulate the final reference count dropping to zero).
-    /// Handles **high-concurrency releases** exactly as requested:
-    /// - Atomic one-time guard.
-    /// - Nodes are moved to a temporary list (via `take`).
-    /// - Cleanup runs outside the lock for maximum concurrency and deadlock freedom.
-    pub fn release(&self) {
-        // Only the first thread to reach here performs cleanup.
-        if self.inner.released.compare_exchange(
-            false,
-            true,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ).is_err() {
-            return; // already released by another thread
-        }
+    unsafe fn node_link(&self) -> &NodeLink {
+        &*self.node_link.get()
+    }
 
-        // Brief critical section: just move the entire list out.
-        let mut list_guard = self.inner.death_notifications.lock().unwrap();
-        let temp_head = list_guard.take();
-        drop(list_guard); // unlock *immediately*
-
-        // Cleanup on the temporary list – no lock held.
-        DeathList::cleanup(temp_head);
+    unsafe fn death_head_mut(&mut self) -> &mut Option<NonNull<DeathEntry>> {
+        &mut *self.death_head.get()
     }
 }
 
-// Optional: auto-release on last Arc drop (real Binder would tie this to refcount).
-// For the simplified module we keep `release` explicit so the caller controls timing.
-impl Drop for BinderNode {
+// RAII handle for BinderNode
+#[derive(Clone)]
+pub struct NodeHandle {
+    ptr: NonNull<BinderNode>,
+}
+
+impl NodeHandle {
+    pub fn object_ptr(&self) -> *mut () {
+        unsafe { self.ptr.as_ref().object_ptr }
+    }
+
+    pub fn acquire_strong(&self) {
+        let node = unsafe { self.ptr.as_ref() };
+        let prev = node.strong_refs.fetch_add(1, Ordering::Acquire);
+        if prev == 0 {
+            // Node was dead, invalid usage (panic or log in real impl)
+            panic!("Acquire on dead node");
+        }
+    }
+
+    pub fn release_strong(&self) {
+        let node = unsafe { self.ptr.as_ref() };
+        let prev = node.strong_refs.fetch_sub(1, Ordering::Release);
+        if prev == 1 {
+            // Last strong ref
+            node.manager.queue_for_cleanup(self.ptr);
+        }
+    }
+}
+
+impl Drop for NodeHandle {
     fn drop(&mut self) {
-        // In a full implementation you could call `self.release()` here,
-        // but that would require careful handling of re-entrancy.
-        // The manual `release` API is deliberately exposed for clarity.
+        self.release_strong();
+    }
+}
+
+// Manager inner state
+struct NodeManagerInner {
+    live_head: Option<NonNull<BinderNode>>,
+    dead_head: Option<NonNull<BinderNode>>,
+}
+
+// Main manager
+#[derive(Clone)]
+pub struct NodeManager {
+    inner: Mutex<NodeManagerInner>,
+}
+
+impl NodeManager {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(NodeManagerInner {
+                live_head: None,
+                dead_head: None,
+            }),
+        })
+    }
+
+    pub fn create_node(&self, object_ptr: *mut ()) -> NodeHandle {
+        let node_box = Box::new(BinderNode::new(self.clone(), object_ptr));
+        let node_ptr = NonNull::new(Box::into_raw(node_box)).unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        Self::insert_node_head(&mut inner.live_head, node_ptr);
+        NodeHandle { ptr: node_ptr }
+    }
+
+    pub fn register_death_recipient(
+        &self,
+        node_handle: &NodeHandle,
+        recipient: Arc<dyn DeathRecipient>,
+        cookie: u64,
+    ) -> DeathHandle {
+        let node = unsafe { node_handle.ptr.as_ref() };
+        let _guard = node.death_lock.lock().unwrap();
+        let mut entry_box = Box::new(DeathEntry::new(recipient, cookie));
+        let entry_ptr = NonNull::new(Box::into_raw(entry_box.as_mut())).unwrap();
+        unsafe {
+            Self::insert_death_head(node.death_head_mut(), entry_ptr.as_mut());
+        }
+        DeathHandle {
+            ptr: entry_ptr,
+            node_ptr: node_handle.ptr,
+        }
+    }
+
+    fn insert_node_head(head: &mut Option<NonNull<BinderNode>>, node_ptr: NonNull<BinderNode>) {
+        unsafe {
+            let node = node_ptr.as_mut();
+            let link = node.node_link_mut();
+            link.prev = None;
+            link.next = (*head).map(|h| {
+                // Update old head's prev
+                let old_node = h.as_mut();
+                old_node.node_link_mut().prev = Some(node_ptr);
+                h
+            });
+            *head = Some(node_ptr);
+        }
+    }
+
+    fn insert_death_head(head: &mut Option<NonNull<DeathEntry>>, entry_ptr: &mut DeathEntry) {
+        unsafe {
+            let link = entry_ptr.link_mut();
+            link.prev = None;
+            link.next = *head;
+            if let Some(old_head) = *head {
+                let old_entry = old_head.as_mut();
+                old_entry.link_mut().prev = Some(entry_ptr.into());
+            }
+            *head = Some(entry_ptr.into());
+        }
+    }
+
+    fn queue_for_cleanup(&self, node_ptr: NonNull<BinderNode>) {
+        let mut inner = self.inner.lock().unwrap();
+        unsafe {
+            let node = node_ptr.as_mut();
+            let link = node.node_link_mut();
+
+            // Unlink from live
+            if let Some(next_ptr) = link.next {
+                let next_node = next_ptr.as_mut();
+                next_node.node_link_mut().prev = link.prev;
+            }
+            if let Some(prev_ptr) = link.prev {
+                let prev_node = prev_ptr.as_mut();
+                prev_node.node_link_mut().next = link.next;
+            } else if inner.live_head == Some(node_ptr) {
+                inner.live_head = link.next;
+            }
+
+            // Clear link
+            link.next = None;
+            link.prev = None;
+
+            // Append to dead (or insert head for simplicity)
+            Self::insert_node_head(&mut inner.dead_head, node_ptr);
+        }
+    }
+
+    /// Process all pending dead nodes (call periodically or as needed)
+    /// Handles high-concurrency by releasing lock between each cleanup
+    pub fn process_dead(&self) {
+        loop {
+            let dead_ptr_opt;
+            {
+                let mut inner = self.inner.lock().unwrap();
+                dead_ptr_opt = inner.dead_head.take();
+                if dead_ptr_opt.is_none() {
+                    return;
+                }
+                // Unlink first dead (already head, update)
+                if let Some(dead_ptr) = dead_ptr_opt {
+                    unsafe {
+                        let link = dead_ptr.as_ref().node_link();
+                        inner.dead_head = link.next;
+                        if let Some(next_dead) = link.next {
+                            let next_node = next_dead.as_mut();
+                            next_node.node_link_mut().prev = None;
+                        }
+                    }
+                }
+            } // drop lock
+
+            if let Some(dead_ptr) = dead_ptr_opt {
+                self.cleanup_single_node(dead_ptr);
+            }
+        }
+    }
+
+    fn cleanup_single_node(&self, node_ptr: NonNull<BinderNode>) {
+        let node = unsafe { node_ptr.as_ref() };
+        // Drain death notifications
+        let mut death_ptrs = Vec::new();
+        let mut cur_head = unsafe { *node.death_head.get() };
+        {
+            let _guard = node.death_lock.lock().unwrap();
+            let mut cur = cur_head;
+            while let Some(c) = cur {
+                death_ptrs.push(c);
+                unsafe {
+                    cur = (*c.as_ptr() as *const DeathEntry).link().next;
+                }
+            }
+            unsafe { *node.death_head.get() = None };
+        } // drop death lock
+
+        // Notify outside locks
+        for death_ptr in death_ptrs {
+            unsafe {
+                let entry = &*death_ptr.as_ptr();
+                entry.recipient.notify(entry.cookie);
+                drop(Box::from_raw(death_ptr.as_ptr() as *mut DeathEntry));
+            }
+        }
+
+        // Free node
+        unsafe { drop(Box::from_raw(node_ptr.as_ptr() as *mut BinderNode)); }
     }
 }

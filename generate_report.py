@@ -23,17 +23,22 @@ def _stable_id(path_str: str) -> str:
 
 
 def _load_sarif(sarif_path: Path):
-    """Return (finding_count, sorted unique ruleId list) from a SARIF file."""
+    """Return (finding_count, sorted unique ruleId list, per-rule count dict) from a SARIF file."""
     if not sarif_path.exists():
-        return 0, []
+        return 0, [], {}
     try:
         with open(sarif_path, encoding="utf-8") as f:
             data = json.load(f)
         results = [r for run in data.get("runs", []) for r in run.get("results", [])]
         rule_ids = sorted({r.get("ruleId", "") for r in results if r.get("ruleId")})
-        return len(results), rule_ids
+        rule_counts: dict[str, int] = {}
+        for r in results:
+            rid = r.get("ruleId", "")
+            if rid:
+                rule_counts[rid] = rule_counts.get(rid, 0) + 1
+        return len(results), rule_ids, rule_counts
     except Exception:
-        return 0, []
+        return 0, [], {}
 
 def main():
     parser = argparse.ArgumentParser(description="Generate CSV statistics and visualization.")
@@ -75,26 +80,26 @@ def main():
         cve_summary = cve_manual.get('summary', {})
 
         # Extract success booleans
-        s1_ok = file_data.get('rustc_compile', {}).get('ok', False)
         s2_check_ok = file_data.get('cargo_check', {}).get('ok', False)
         s2_clippy_ok = file_data.get('clippy', {}).get('ok', False)
         s3_ok = file_data.get('codeql', {}).get('ok', False) if file_data.get('codeql') else False
 
         # Load CodeQL SARIF findings (only present when codeql ran successfully)
         sarif_path = input_dir / "codeql" / _stable_id(source) / "codeql-results.sarif"
-        codeql_finding_count, codeql_rule_ids = _load_sarif(sarif_path)
+        codeql_finding_count, codeql_rule_ids, rule_counts = _load_sarif(sarif_path)
         codeql_findings_str = ", ".join(codeql_rule_ids) if codeql_rule_ids else ("none" if s3_ok else "")
+        cve_hits = rule_counts.get("rust/lock-drop-before-list-traversal", 0)
 
         unsafe_count = cve_summary.get('unsafe', 0)
 
         records.append({
             'Strategy': strategy,
             'File': source,
-            'Station 1: Raw Compile (rustc)': s1_ok,
             'Station 2: Project Compile (cargo check)': s2_check_ok,
             'Station 2: Idiomatic (cargo clippy)': s2_clippy_ok,
             'Station 3: Security Audit (CodeQL)': s3_ok,
             'Station 3: CodeQL Findings': codeql_finding_count,
+            'Station 3: CVE-2025-68260 Hits': cve_hits,
             'Station 4: Unsafe Block Count': unsafe_count,
         })
 
@@ -111,7 +116,6 @@ def main():
         error_details.append({
             'Strategy': strategy,
             'File': source,
-            'S1 Error': file_data.get('rustc_compile', {}).get('stderr', '').strip() if not s1_ok else '',
             'S2 Check Error': file_data.get('cargo_check', {}).get('stderr', '').strip() if not s2_check_ok else '',
             'S2 Clippy Issue': file_data.get('clippy', {}).get('stderr', '').strip() if not s2_clippy_ok else '',
             'S3 CodeQL Issue': s3_issue,
@@ -125,11 +129,11 @@ def main():
     # 2. Performance Report (Raw Counts)
     perf_summary = df.groupby('Strategy').agg(
         Total_Samples=('File', 'size'),
-        Stage1_rustc=('Station 1: Raw Compile (rustc)', 'sum'),
         Stage2_check=('Station 2: Project Compile (cargo check)', 'sum'),
         Stage2_clippy=('Station 2: Idiomatic (cargo clippy)', 'sum'),
         Stage3_CodeQL_Pass=('Station 3: Security Audit (CodeQL)', 'sum'),
         Stage3_CodeQL_Findings=('Station 3: CodeQL Findings', 'sum'),
+        Stage3_CVE_2025_68260_Hits=('Station 3: CVE-2025-68260 Hits', 'sum'),
         Stage4_Unsafe_Count=('Station 4: Unsafe Block Count', 'sum'),
     )
     perf_csv = output_dir / "performance_report.csv"
@@ -147,9 +151,8 @@ def main():
     fig.suptitle('LLM Performance by Prompting Strategy', fontsize=15, fontweight='bold', y=0.98)
 
     # --- Subplot 1: Pass/fail counts (Stage 1–3) ---
-    pass_cols = ['Stage1_rustc', 'Stage2_check', 'Stage2_clippy', 'Stage3_CodeQL_Pass']
+    pass_cols = ['Stage2_check', 'Stage2_clippy', 'Stage3_CodeQL_Pass']
     pass_labels = {
-        'Stage1_rustc':        'S1: Raw Compile (rustc)',
         'Stage2_check':        'S2: Project Compile (cargo check)',
         'Stage2_clippy':       'S2: Idiomatic (cargo clippy)',
         'Stage3_CodeQL_Pass':  'S3: CodeQL Pass',
@@ -157,7 +160,7 @@ def main():
     pass_df = perf_summary[pass_cols].rename(columns=pass_labels).reset_index()
     melted_pass = pass_df.melt(id_vars='Strategy', var_name='Stage', value_name='Samples Passing')
 
-    palette1 = ["#2196F3", "#4CAF50", "#FF9800", "#9C27B0"]
+    palette1 = ["#4CAF50", "#FF9800", "#9C27B0"]  # green, orange, purple
     sns.barplot(data=melted_pass, x='Strategy', y='Samples Passing',
                 hue='Stage', palette=palette1, ax=ax1)
     ax1.set_title('Compilation & Static Analysis — Pass Counts', fontsize=12)
@@ -173,15 +176,16 @@ def main():
                          textcoords='offset points')
 
     # --- Subplot 2: Count metrics (CodeQL findings + unsafe block count) ---
-    count_cols = ['Stage3_CodeQL_Findings', 'Stage4_Unsafe_Count']
+    count_cols = ['Stage3_CodeQL_Findings', 'Stage3_CVE_2025_68260_Hits', 'Stage4_Unsafe_Count']
     count_labels = {
-        'Stage3_CodeQL_Findings': 'S3: CodeQL Security Findings',
-        'Stage4_Unsafe_Count':    'S4: Unsafe Block Count',
+        'Stage3_CodeQL_Findings':      'S3: CodeQL Security Findings',
+        'Stage3_CVE_2025_68260_Hits':  'S3: CVE-2025-68260 Pattern Hits',
+        'Stage4_Unsafe_Count':         'S4: Unsafe Block Count',
     }
     count_df = perf_summary[count_cols].rename(columns=count_labels).reset_index()
     melted_count = count_df.melt(id_vars='Strategy', var_name='Metric', value_name='Count')
 
-    palette2 = ["#F44336", "#FF9800"]
+    palette2 = ["#F44336", "#1565C0", "#FF9800"]  # red, dark-blue, orange
     sns.barplot(data=melted_count, x='Strategy', y='Count',
                 hue='Metric', palette=palette2, ax=ax2)
     ax2.set_title('Security Metrics — Counts per Strategy', fontsize=12)
