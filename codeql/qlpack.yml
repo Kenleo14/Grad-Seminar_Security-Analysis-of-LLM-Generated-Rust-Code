@@ -1,0 +1,5 @@
+name: local/cve-2025-68260-detection
+version: 0.0.1
+extractor: rust
+dependencies:
+  codeql/rust-all: "*"

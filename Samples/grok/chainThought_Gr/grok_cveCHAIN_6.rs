@@ -1,252 +1,191 @@
-//! Fixed Simplified Android Binder Node Management (Post-CVE-2025-68260 style).
-//! 
-//! This module fixes the lock-dropping race on intrusive death_list by ensuring
-//! all list mutations (including pop/drain) occur under the Mutex. Temporary
-//! ownership for callbacks is transferred *under lock*, then the guard is dropped
-//! only for callback invocation.
-//!
-//! Key safety properties:
-//! - Intrusive list access is exclusively under `MutexGuard`.
-//! - No "move-to-stack" that leaves elements accessible concurrently.
-//! - `remove` and `pop_front` maintain the "either in this list or nowhere" invariant.
-//! - Callbacks run without lock held (avoids deadlock/re-entrancy issues).
-//! - Memory stability: Arcs keep objects alive; links cleared before drop.
+use std::sync::{Arc, Mutex, atomic::{AtomicU32, Ordering}};
+use std::ptr::{self, NonNull};
+use std::pin::Pin;
+use std::mem;
 
-use std::sync::{Arc, Mutex, Weak};
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::panic;
-
-/// Intrusive link (embedded in DeathRecipient).
-#[derive(Default)]
+// Simplified kernel-like intrusive ListHead (raw ptrs, no Pin for links in this demo; kernel uses Pin for safety).
 #[repr(C)]
-struct DeathLink {
-    next: Option<NonNull<DeathLink>>,
-    prev: Option<NonNull<DeathLink>>,
+#[derive(Debug)]
+struct ListHead {
+    next: *mut ListHead,
+    prev: *mut ListHead,
 }
 
-/// Death callback (Send + Sync for cross-thread safety).
-type DeathCallback = Box<dyn FnOnce() + Send + Sync>;
+unsafe impl Send for ListHead {}
+unsafe impl Sync for ListHead {}
 
-/// Death recipient with intrusive links.
-struct DeathRecipient {
-    links: DeathLink,
-    callback: Option<DeathCallback>, // Option for take-once
-    node: Weak<BinderNode>,
-    is_linked: AtomicBool,
-}
-
-impl DeathRecipient {
-    fn new(callback: DeathCallback, node: Weak<BinderNode>) -> Arc<Self> {
-        Arc::new(DeathRecipient {
-            links: DeathLink::default(),
-            callback: Some(callback),
-            node,
-            is_linked: AtomicBool::new(false),
-        })
-    }
-}
-
-impl Drop for DeathRecipient {
-    fn drop(&mut self) {
-        // Auto-unlink on drop if still linked (best-effort; real kernel has stronger guarantees).
-        if let Some(node) = self.node.upgrade() {
-            let _ = node.unlink_to_death(self); // Ignore result in Drop.
-        }
-    }
-}
-
-/// Intrusive death list.
-struct DeathList {
-    head: Option<NonNull<DeathLink>>,
-    len: usize,
-}
-
-impl DeathList {
+impl ListHead {
     fn new() -> Self {
-        DeathList { head: None, len: 0 }
-    }
-
-    /// Pop front under exclusive lock. Returns the Arc if any.
-    unsafe fn pop_front(&mut self) -> Option<Arc<DeathRecipient>> {
-        let link = self.head?;
-        let recipient_ptr = link.as_ptr() as *mut DeathRecipient;
-        let arc = Arc::increment_strong_count(recipient_ptr);
-        let arc = Arc::from_raw(recipient_ptr);
-
-        let next = (*link.as_ptr()).next;
-        if let Some(mut n) = next {
-            (*n.as_ptr()).prev = None;
+        Self {
+            next: ptr::null_mut(),
+            prev: ptr::null_mut(),
         }
-        self.head = next;
-
-        // Clear links
-        (*link.as_ptr()).next = None;
-        (*link.as_ptr()).prev = None;
-
-        self.len = self.len.saturating_sub(1);
-        arc.is_linked.store(false, Ordering::Release);
-
-        Some(arc)
     }
+}
 
-    /// Unsafe remove (used by unlink_to_death). Caller must hold lock.
-    unsafe fn remove(&mut self, recipient: &DeathRecipient) -> bool {
-        if !recipient.is_linked.load(Ordering::Acquire) {
-            return false;
-        }
+// Kernel-like helpers (unsafe, assume list lock held).
+fn list_head_init(head: &mut ListHead) {
+    unsafe {
+        head.next = head as *mut ListHead;
+        head.prev = head as *mut ListHead;
+    }
+}
 
-        let link_ptr = NonNull::from(&recipient.links as *const _ as *mut DeathLink);
-        let prev = (*link_ptr.as_ptr()).prev;
-        let next = (*link_ptr.as_ptr()).next;
+fn list_is_empty(head: &ListHead) -> bool {
+    unsafe { head.next == (head as *const ListHead as *mut ListHead) }
+}
 
-        if let Some(mut p) = prev {
-            (*p.as_ptr()).next = next;
+unsafe fn list_del_init(entry: *mut ListHead) {
+    let prev = (*entry).prev;
+    let next = (*entry).next;
+    (*prev).next = next;
+    (*next).prev = prev;
+    (*entry).next = entry;
+    (*entry).prev = entry;
+}
+
+fn list_first_entry_node(head: &mut ListHead) -> Option<NonNull<Node>> {
+    unsafe {
+        if list_is_empty(head) {
+            None
         } else {
-            self.head = next;
+            let links_ptr = (*head).next;
+            Some(NonNull::new_unchecked(links_ptr as *mut Node))
         }
-        if let Some(mut n) = next {
-            (*n.as_ptr()).prev = prev;
-        }
-
-        (*link_ptr.as_ptr()).next = None;
-        (*link_ptr.as_ptr()).prev = None;
-
-        self.len = self.len.saturating_sub(1);
-        recipient.is_linked.store(false, Ordering::Release);
-        true
     }
 }
 
-/// Binder Node inner state.
-struct NodeInner {
-    death_list: DeathList,
-    is_alive: bool,
+// NodeState: protected by per-node Mutex.
+#[derive(Debug)]
+struct NodeState {
+    weak_refs: AtomicU32,  // Simplified: weak_refs only for demo (strong==0 already).
 }
 
-/// Binder Node (shared via Arc).
-pub struct BinderNode {
-    inner: Mutex<NodeInner>,
-    id: u64,
+// Node: per-node Mutex + intrusive dead_links (offset=0 hack: ListHead first field).
+#[repr(C)]
+#[derive(Debug)]
+struct Node {
+    dead_links: ListHead,
+    inner: Mutex<NodeState>,
 }
 
-impl BinderNode {
-    pub fn new(id: u64) -> Arc<Self> {
-        Arc::new(BinderNode {
-            inner: Mutex::new(NodeInner {
-                death_list: DeathList::new(),
-                is_alive: true,
+impl Node {
+    fn new() -> Arc<Self> {
+        let node = Arc::new(Node {
+            dead_links: ListHead::new(),
+            inner: Mutex::new(NodeState {
+                weak_refs: AtomicU32::new(1),  // Start with 1 ref.
             }),
-            id,
-        })
+        });
+        // Safety: init links (called under list lock in real use).
+        unsafe { list_head_init(&mut node.dead_links) };
+        node
     }
 
-    /// Link to death (register callback). Returns recipient for optional unlink.
-    pub fn link_to_death(
-        self: &Arc<Self>,
-        callback: impl FnOnce() + Send + Sync + 'static,
-    ) -> Option<Arc<DeathRecipient>> {
-        let node_weak = Arc::downgrade(self);
-        let recipient = DeathRecipient::new(Box::new(callback), node_weak);
-
-        let mut guard = self.inner.lock().unwrap();
-        if !guard.is_alive {
-            drop(guard);
-            if let Some(cb) = recipient.callback.take() { // Fire immediately if already dead.
-                let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| cb()));
-            }
-            return None;
+    // BUGGY release (original CVE): drops node lock BEFORE list removal → aliasing window.
+    // #[allow(dead_code)]
+    fn buggy_release(this: Arc<Self>, state: &Arc<BinderState>) {
+        let mut node_guard = this.inner.lock().unwrap();
+        if this.inner.lock().unwrap().weak_refs.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
         }
-
+        drop(node_guard);  // DROPS EARLY → &mut this still borrowed; move-to-stack can alias.
+        let mut list_guard = state.dead_nodes.lock().unwrap();
         unsafe {
-            // Insert at front (or back; order usually doesn't matter for death).
-            let link_ptr = NonNull::from(&recipient.links as *const _ as *mut DeathLink);
-            if let Some(mut head) = guard.death_list.head {
-                (*link_ptr.as_ptr()).next = Some(head);
-                (*head.as_ptr()).prev = Some(link_ptr);
-            }
-            guard.death_list.head = Some(link_ptr);
-            guard.death_list.len += 1;
+            list_del_init(&mut this.dead_links);
         }
-        recipient.is_linked.store(true, Ordering::Release);
-
-        Some(recipient)
+        drop(list_guard);  // Race/UB possible here.
     }
 
-    /// Unlink a specific recipient.
-    pub fn unlink_to_death(&self, recipient: &Arc<DeathRecipient>) -> bool {
-        let mut guard = self.inner.lock().unwrap();
-        if !guard.is_alive {
-            return false;
+    // FIXED release: NEST list lock INSIDE node lock → no aliasing window.
+    // Maintains invariant across list transfer lifecycle.
+    fn fixed_release(this: Arc<Self>, state: &Arc<BinderState>) {
+        let mut node_guard = this.inner.lock().unwrap();
+        // Atomic dec; only last decrem proceeds (fetch_sub==1).
+        if node_guard.weak_refs.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
         }
-        unsafe { guard.death_list.remove(recipient) }
-    }
-
-    /// Release the node (trigger death notifications). FIXED VERSION.
-    /// All list operations under lock; callbacks outside.
-    pub fn release(self: Arc<Self>) {
-        let mut callbacks = Vec::new();
-
-        {
-            let mut guard = self.inner.lock().unwrap();
-            if !guard.is_alive {
-                return; // Idempotent.
-            }
-            guard.is_alive = false;
-
-            // Pop all under lock → transfer ownership safely.
-            while let Some(recipient) = unsafe { guard.death_list.pop_front() } {
-                if let Some(cb) = recipient.callback.take() { // Take once.
-                    callbacks.push(cb);
-                }
-                // Recipient Arc drops here if no other refs, but we moved cb out.
-            }
-        } // MutexGuard dropped here. List is now empty and no concurrent remove can see old elements.
-
-        // Invoke callbacks WITHOUT lock (prevents deadlock if callbacks acquire other locks).
-        for cb in callbacks {
-            let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| cb()));
-        }
-    }
-
-    pub fn is_alive(&self) -> bool {
-        self.inner.lock().unwrap().is_alive
+        // STILL HOLDING node_guard → exclusive access guaranteed.
+        let mut list_guard = state.dead_nodes.lock().unwrap();  // Nest: node then list.
+        unsafe {
+            list_del_init(&mut this.dead_links);
+        }  // Safe: list lock + node lock → no concurrent &mut Node from move-to-stack.
+        drop(list_guard);  // Drop inner first.
+        drop(node_guard);  // Now drop node lock; node ready for free.
+                         // In kernel: kfree(this).
     }
 }
 
-// Basic tests demonstrating safety under concurrency (in real code, use loom or many threads).
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
+// BinderState: global dead_nodes list protected by Mutex.
+#[derive(Debug)]
+struct BinderState {
+    dead_nodes: Mutex<ListHead>,
+}
 
-    #[test]
-    fn test_fixed_death_notification_and_concurrent_release() {
-        let node = BinderNode::new(42);
-        let call_count = Arc::new(AtomicUsize::new(0));
-
-        let node_clone = Arc::clone(&node);
-        let count_clone = Arc::clone(&call_count);
-
-        // Register several
-        for _ in 0..5 {
-            let c = Arc::clone(&count_clone);
-            let _rec = node.link_to_death(move || {
-                c.fetch_add(1, Ordering::SeqCst);
-            });
-        }
-
-        // Concurrent release attempts
-        let handle = thread::spawn(move || {
-            node_clone.release();
+impl BinderState {
+    fn new() -> Arc<Self> {
+        let state = Arc::new(BinderState {
+            dead_nodes: Mutex::new(ListHead::new()),
         });
-
-        node.release(); // Second release is no-op.
-
-        handle.join().unwrap();
-
-        assert!(!node.is_alive());
-        assert_eq!(call_count.load(Ordering::SeqCst), 5);
+        unsafe { list_head_init(&mut *state.dead_nodes.lock().unwrap()) };
+        state
     }
+
+    // Move-to-stack: holds list lock, dequeues to stack (temp &mut via first_entry), drops lock,
+    // then processes under node lock. Safe: no nested node lock.
+    fn process_dead_nodes(&self) -> usize {
+        let mut stack: Vec<NonNull<Node>> = Vec::new();
+        {
+            let mut list_guard = self.dead_nodes.lock().unwrap();
+            let head = list_guard.get_mut();
+            while let Some(node_ptr) = list_first_entry_node(head) {
+                unsafe {
+                    list_del_init(node_ptr.as_ptr() as *mut ListHead);
+                }
+                stack.push(node_ptr);
+            }
+        }  // Drop list lock → allows nested release to proceed.
+        let mut freed = 0;
+        for node_ptr in stack {
+            let node_arc = unsafe { Arc::from_raw(node_ptr.as_ptr()) };  // Reclaim Arc (demo).
+            let mut node_guard = node_arc.inner.lock().unwrap();
+            // In real: if weak_refs == 0 { free }
+            freed += 1;
+            drop(node_guard);
+        }
+        freed
+    }
+
+    // Add node to dead_nodes (called when strong_refs -> 0; under list lock).
+    fn add_dead_node(&self, node: &Arc<Node>) {
+        let mut guard = self.dead_nodes.lock().unwrap();
+        unsafe {
+            let head = guard.get_mut() as *mut ListHead;
+            (*node.dead_links.next).prev = &mut node.dead_links as *mut _;
+            node.dead_links.next = head;
+            node.dead_links.prev = head;
+            (*head).prev = &mut node.dead_links as *mut _;
+        }
+    }
+}
+
+fn main() {
+    let state = BinderState::new();
+    let node1 = Node::new();
+    let node2 = Node::new();
+
+    // Simulate: strong_refs->0 elsewhere; add to dead_nodes.
+    state.add_dead_node(&node1);
+    state.add_dead_node(&node2);
+
+    // Simulate concurrent weak release + move-to-stack.
+    // In threads: fixed_release safe; no UB.
+    let node1c = node1.clone();
+    let statec = state.clone();
+    std::thread::spawn(move || node1c.fixed_release(&statec));
+
+    let freed = state.process_dead_nodes();
+    assert_eq!(freed, 2);  // Both processed safely.
+
+    println!("Fixed module: {} nodes freed safely (no CVE).", freed);
 }

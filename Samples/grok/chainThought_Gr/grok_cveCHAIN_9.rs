@@ -1,133 +1,166 @@
-//! Fixed simplified Android Binder Node management system.
-//! Addresses CVE-2025-68260 by maintaining the synchronization invariant
-//! for the *entire* list-transfer lifecycle (swap + processing).
-//! The intrusive list is protected by the mutex at all times; the temp list
-//! never escapes the locked section.
+//! Fixed rust_binder intrusive list module.
+//! Demonstrates lock-held removal to fix CVE-2024-35812 aliasing UB.
 
-use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use core::ptr;
+use std::sync::Mutex; // Kernel equiv: kernel::sync::Mutex<()>
+use std::vec::Vec;
 
-/// Death notification entry with embedded intrusive links.
-pub struct DeathNotification {
-    id: u64,
-    callback: Option<Box<dyn FnOnce(u64) + Send>>,
-    links: ListLinks,
+/// Intrusive doubly-linked list head (null-terminated).
+#[repr(C)]
+pub struct IntrusiveList {
+    head: *mut Node,
 }
 
-#[derive(Default)]
-struct ListLinks {
-    next: Option<NonNull<DeathNotification>>,
-    prev: Option<NonNull<DeathNotification>>,
+/// Binder node with intrusive links (simulates `struct binder_node`).
+#[repr(C)]
+pub struct Node {
+    pub prev: *mut Node,
+    pub next: *mut Node,
+    pub strong_refs: usize,
+    pub weak_refs: usize,
+    pub data: usize, // Opaque payload.
 }
 
-impl DeathNotification {
-    pub fn new(id: u64, callback: impl FnOnce(u64) + Send + 'static) -> Self {
-        Self {
-            id,
-            callback: Some(Box::new(callback)),
-            links: ListLinks::default(),
-        }
-    }
+/// Fixed Binder module (simulates `struct binder_device`).
+pub struct BinderFixed {
+    lock: Mutex<()>,
+    dead_nodes: IntrusiveList, // e.g., dead_binder_nodes list.
 }
 
-struct BinderNodeInner {
-    death_list_head: Option<NonNull<DeathNotification>>,
-}
-
-pub struct BinderNode {
-    inner: Mutex<BinderNodeInner>,
-}
-
-impl BinderNode {
+impl BinderFixed {
+    /// Create new instance.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(BinderNodeInner {
-                death_list_head: None,
-            }),
+            lock: Mutex::new(()),
+            dead_nodes: IntrusiveList {
+                head: ptr::null_mut(),
+            },
         }
     }
 
-    /// Register a death notification. Ownership transferred to the list.
-    pub fn register_death(&self, death: Box<DeathNotification>) {
-        let entry = NonNull::new(Box::into_raw(death)).expect("Box::into_raw never returns null");
-        let mut guard = self.inner.lock().unwrap();
-        add_to_list(&mut guard.death_list_head, entry);
-    }
+    /// Allocate a new node and add to dead_nodes list (simulates creation/dead state).
+    pub fn alloc_dead_node(&self, data: usize) -> *mut Node {
+        let node = Box::into_raw(Box::new(Node {
+            prev: ptr::null_mut(),
+            next: ptr::null_mut(),
+            strong_refs: 1,
+            weak_refs: 0,
+            data,
+        }));
 
-    /// Example unsafe removal path (mirrors rust_binder). In a real system
-    /// this would be exposed via a registration token. The safety contract
-    /// is now upheld because the release path never drops the lock early.
-    pub unsafe fn unregister_death(&self, death: NonNull<DeathNotification>) {
-        let mut guard = self.inner.lock().unwrap();
-        remove_from_list(&mut guard.death_list_head, death);
-    }
-}
-
-/// O(1) add to front (same as before).
-fn add_to_list(head: &mut Option<NonNull<DeathNotification>>, entry: NonNull<DeathNotification>) {
-    unsafe {
-        let entry_mut = entry.as_mut();
-        entry_mut.links.next = *head;
-        entry_mut.links.prev = None;
-        if let Some(old) = *head {
-            old.as_mut().links.prev = Some(entry);
-        }
-        *head = Some(entry);
-    }
-}
-
-/// Unsafe removal by direct pointer surgery (mirrors the CVE-vulnerable code).
-/// # Safety
-/// - The entry must be in this list or already removed.
-/// - The caller must hold the node's lock (invariant now maintained
-///   for the full list-transfer lifecycle in `Drop`).
-fn remove_from_list(head: &mut Option<NonNull<DeathNotification>>, entry: NonNull<DeathNotification>) {
-    unsafe {
-        let e = entry.as_mut();
-        let prev = e.links.prev;
-        let next = e.links.next;
-
-        if let Some(p) = prev {
-            p.as_mut().links.next = next;
-        } else {
-            // Was head
-            *head = next;
-        }
-        if let Some(n) = next {
-            n.as_mut().links.prev = prev;
-        }
-    }
-}
-
-/// Process the temporary list. Runs *while the lock is still held*.
-fn process_death_notifications(mut head: Option<NonNull<DeathNotification>>) {
-    while let Some(node_ptr) = head {
+        let _guard = self.lock.lock().unwrap();
         unsafe {
-            let next = node_ptr.as_ref().links.next;
-            let node = &mut *node_ptr.as_ptr();
-            if let Some(cb) = node.callback.take() {
-                cb(node.id);
-            }
-            let _ = Box::from_raw(node_ptr.as_ptr());
-            head = next;
+            Self::push_front(&mut self.dead_nodes, node);
         }
+        node
+    }
+
+    /// Release node: FIXED - hold lock across check + full removal.
+    /// Concurrent move_to_stack safe (no aliasing UB).
+    pub fn node_release(&self, node: *mut Node) {
+        let guard = self.lock.lock().unwrap(); // Acquire.
+        unsafe {
+            // Simulate ref drop (in real: atomic_fetch_sub).
+            (*node).strong_refs = (*node).strong_refs.saturating_sub(1);
+            (*node).weak_refs = (*node).weak_refs.saturating_sub(1);
+            if (*node).strong_refs == 0 && (*node).weak_refs == 0 {
+                // FULL removal under lock: invariant holds.
+                remove_node_from_list(node, &mut self.dead_nodes);
+                drop(guard); // Drop after removal.
+                // Free: kernel::alloc::kfree(node as *mut _);
+                println!("Fixed: Freed node {:?} (data={})", node, (*node).data);
+                unsafe { drop(Box::from_raw(node)) };
+            } else {
+                // Keep alive.
+            }
+        }
+    }
+
+    /// Move-to-stack: Drain entire list to Vec under lock (e.g., bc_dead_binder processing).
+    /// Concurrent release races fixed.
+    pub fn move_to_stack(&self) -> Vec<*mut Node> {
+        let mut stack: Vec<*mut Node> = Vec::new();
+        let guard = self.lock.lock().unwrap();
+        unsafe {
+            while let Some(node) = pop_front(&mut self.dead_nodes) {
+                stack.push(node);
+            }
+        }
+        // Guard drops here: list empty.
+        stack
+    }
+
+    /// Unsafe helpers (called ONLY under lock).
+    unsafe fn push_front(list: &mut IntrusiveList, node: *mut Node) {
+        (*node).prev = ptr::null_mut();
+        (*node).next = list.head;
+        if !list.head.is_null() {
+            (*list.head).prev = node;
+        }
+        list.head = node;
     }
 }
 
-impl Drop for BinderNode {
-    fn drop(&mut self) {
-        let mut guard = self.inner.lock().unwrap();
+/// Core unsafe list ops: VALID ONLY under binder_lock (no aliasing).
+unsafe fn remove_node_from_list(node: *mut Node, list: &mut IntrusiveList) {
+    let prev = (*node).prev;
+    let next = (*node).next;
+    if !prev.is_null() {
+        // Internal node.
+        (*prev).next = next;
+    } else {
+        // Head node: update list.head.
+        list.head = next;
+    }
+    if !next.is_null() {
+        (*next).prev = prev;
+    }
+    // Poison links.
+    (*node).prev = ptr::null_mut();
+    (*node).next = ptr::null_mut();
+}
 
-        // === CRITICAL: List transfer under lock ===
-        let mut temp_head = None;
-        std::mem::swap(&mut guard.death_list_head, &mut temp_head);
-        // ===========================================
+unsafe fn pop_front(list: &mut IntrusiveList) -> Option<*mut Node> {
+    let head = list.head;
+    if head.is_null() {
+        return None;
+    }
+    let next = (*head).next;
+    list.head = next;
+    if !next.is_null() {
+        (*next).prev = ptr::null_mut();
+    }
+    (*head).prev = ptr::null_mut();
+    (*head).next = ptr::null_mut();
+    Some(head)
+}
 
-        // Process the temporary list *before* the guard drops.
-        // This maintains the synchronization invariant for the entire
-        // lifecycle of the moved list (no concurrent remove can interleave).
-        process_death_notifications(temp_head);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        // Lock released only after processing completes.
+    #[test]
+    fn test_fixed_no_race() {
+        let binder = BinderFixed::new();
+        let node1 = binder.alloc_dead_node(42);
+        let node2 = binder.alloc_dead_node(99);
+
+        // Simulate concurrent move-to-stack.
+        let stack1 = binder.move_to_stack();
+        assert_eq!(stack1.len(), 2);
+        assert_eq!(unsafe { (*stack1[0]).data }, 99); // LIFO push_front.
+        assert_eq!(unsafe { (*stack1[1]).data }, 42);
+
+        // Release (would race in buggy, but safe here).
+        unsafe {
+            (*node1).strong_refs = 0;
+            (*node1).weak_refs = 0;
+        }
+        binder.node_release(node1);
+        // node2 already moved.
+
+        // List now empty.
+        let stack2 = binder.move_to_stack();
+        assert!(stack2.is_empty());
     }
 }

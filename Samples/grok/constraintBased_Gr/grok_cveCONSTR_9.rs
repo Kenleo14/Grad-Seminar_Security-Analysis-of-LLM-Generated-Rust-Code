@@ -1,166 +1,184 @@
-//! Thread-safe intrusive linked-list cleanup routine for Binder-style death notifications.
-//! Satisfies all requirements: unsafe pointer manipulation, O(1) release() with move-to-stack,
-//! CVE-2025-68260 avoidance via released-flag synchronization, and std::sync::Mutex.
+use std::mem::ManuallyDrop;
+use std::ptr;
+use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
 
-use std::ptr::NonNull;
-use std::sync::Mutex;
-
-/// Death notification entry with embedded intrusive links (mimicking rust_binder).
-pub struct DeathNotification {
-    id: u64,
-    callback: Option<Box<dyn FnOnce(u64) + Send>>,
-    links: ListLinks,
+#[repr(C)]
+pub struct Node {
+    pub next: *mut Node,
+    pub prev: *mut Node,
 }
 
-#[derive(Default)]
-struct ListLinks {
-    next: Option<NonNull<DeathNotification>>,
-    prev: Option<NonNull<DeathNotification>>,
+/// An intrusive doubly-linked list with thread-safe operations using a mutex for synchronization.
+/// Mimics kernel-style intrusive lists (e.g., rust_binder). Uses a dummy head node.
+/// Supports fast O(1) release() drain to a local stack (backward traversal for LIFO processing).
+/// Avoids CVE-2025-68260 race by using a draining flag to block concurrent remove()/insert() during processing,
+/// ensuring prev/next pointers remain valid and unmodified.
+pub struct List {
+    head: *mut Node,
+    lock: Mutex<()>,
+    draining: AtomicBool,
+    _dummy: ManuallyDrop<Node>,
 }
 
-impl DeathNotification {
-    /// Create a new death notification. Ownership is transferred to the list on registration.
-    pub fn new(id: u64, callback: impl FnOnce(u64) + Send + 'static) -> Self {
-        Self {
-            id,
-            callback: Some(Box::new(callback)),
-            links: ListLinks::default(),
-        }
-    }
-}
-
-/// Internal node state protected by the mutex.
-struct BinderNodeInner {
-    /// Head of the intrusive list (None when empty).
-    death_list_head: Option<NonNull<DeathNotification>>,
-    /// Synchronization flag that prevents any concurrent remove() from touching
-    /// the temporary list after release(). This is the exact invariant that
-    /// eliminates the CVE-2025-68260 race.
-    released: bool,
-}
-
-/// Binder node exposing the thread-safe cleanup routine.
-pub struct BinderNode {
-    inner: Mutex<BinderNodeInner>,
-}
-
-impl BinderNode {
-    /// Create a new Binder node.
+impl List {
+    /// Creates a new empty list.
     pub fn new() -> Self {
+        let mut dummy = Node {
+            next: ptr::null_mut(),
+            prev: ptr::null_mut(),
+        };
+        let head_ptr = &mut dummy as *mut Node;
+        unsafe {
+            (*head_ptr).next = head_ptr;
+            (*head_ptr).prev = head_ptr;
+        }
         Self {
-            inner: Mutex::new(BinderNodeInner {
-                death_list_head: None,
-                released: false,
-            }),
+            head: head_ptr,
+            lock: Mutex::new(()),
+            draining: AtomicBool::new(false),
+            _dummy: ManuallyDrop::new(dummy),
         }
     }
 
-    /// Register a death notification. Transfers ownership via raw pointer.
-    pub fn register_death(&self, death: Box<DeathNotification>) {
-        let entry = NonNull::new(Box::into_raw(death)).expect("Box::into_raw never returns null");
-        let mut guard = self.inner.lock().unwrap();
-        add_to_list(&mut guard.death_list_head, entry);
+    /// Initializes a node for insertion (sets prev/next to null).
+    pub fn init_node(node: *mut Node) {
+        unsafe {
+            (*node).next = ptr::null_mut();
+            (*node).prev = ptr::null_mut();
+        }
     }
 
-    /// Unsafe unregistration (mirrors rust_binder). The safety contract is now upheld
-    /// because of the released-flag check.
-    ///
-    /// # Safety
-    /// - `death` must have been previously registered on this node (or already removed).
-    /// - Caller must guarantee the pointer is still valid until this call returns.
-    pub unsafe fn unregister_death(&self, death: NonNull<DeathNotification>) {
-        let mut guard = self.inner.lock().unwrap();
-        if guard.released {
-            // Node has already been moved to the temporary cleanup list.
-            // Any pointer surgery here would violate aliasing rules.
-            // We skip → prev/next pointers of the temp list remain valid and synchronized.
+    /// Pushes a node to the front of the list.
+    pub fn push_front(&self, node: *mut Node) {
+        let _guard = self.lock.lock().unwrap();
+        if self.draining.load(Ordering::Relaxed) {
             return;
         }
-        remove_from_list(&mut guard.death_list_head, death);
+        unsafe { Self::_list_add(self.head, node) };
     }
 
-    /// Thread-safe cleanup routine (the core of the request).
-    /// Moves the entire death list to a local stack temporary list in O(1) time,
-    /// sets the released flag, drops the lock immediately, then processes the
-    /// temporary list outside the lock.
-    pub fn release(&self) {
-        let mut guard = self.inner.lock().unwrap();
-
-        // === O(1) critical section – minimal lock contention ===
-        let mut temp_head = None;
-        std::mem::swap(&mut guard.death_list_head, &mut temp_head);
-        guard.released = true;
-        // =======================================================
-
-        // Lock is dropped here. The temporary list is now exclusively owned
-        // by this thread. No concurrent unregister_death() can ever mutate
-        // its prev/next pointers because of the flag check above.
-        drop(guard);
-
-        // Process outside the lock (callbacks can do arbitrary work).
-        process_death_notifications(temp_head);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Unsafe intrusive-list helpers (exactly as required, mimicking rust_binder)
-// ---------------------------------------------------------------------------
-
-fn add_to_list(head: &mut Option<NonNull<DeathNotification>>, entry: NonNull<DeathNotification>) {
-    unsafe {
-        let entry_mut = entry.as_mut();
-        entry_mut.links.next = *head;
-        entry_mut.links.prev = None;
-
-        if let Some(old_head) = *head {
-            old_head.as_mut().links.prev = Some(entry);
+    /// Pushes a node to the back of the list.
+    pub fn push_back(&self, node: *mut Node) {
+        let _guard = self.lock.lock().unwrap();
+        if self.draining.load(Ordering::Relaxed) {
+            return;
         }
-        *head = Some(entry);
+        unsafe { Self::_list_add_tail(self.head, node) };
     }
-}
 
-fn remove_from_list(head: &mut Option<NonNull<DeathNotification>>, entry: NonNull<DeathNotification>) {
-    unsafe {
-        let e = entry.as_mut();
-        let prev = e.links.prev;
-        let next = e.links.next;
-
-        if let Some(p) = prev {
-            p.as_mut().links.next = next;
-        } else {
-            *head = next; // was head
+    /// Removes a node from the list if present (with validation).
+    /// Safe against concurrent release(): skips if draining.
+    /// Validates doubly-linked consistency to prevent corruption.
+    pub fn remove(&self, node: *mut Node) {
+        let _guard = self.lock.lock().unwrap();
+        if self.draining.load(Ordering::Relaxed) {
+            return;
         }
-        if let Some(n) = next {
-            n.as_mut().links.prev = prev;
-        }
-        // Optional: zero the links for extra safety/debugging
-        e.links.next = None;
-        e.links.prev = None;
-    }
-}
-
-fn process_death_notifications(mut head: Option<NonNull<DeathNotification>>) {
-    while let Some(node_ptr) = head {
         unsafe {
-            // Read next *before* any mutation or drop.
-            let next = node_ptr.as_ref().links.next;
-
-            let node = &mut *node_ptr.as_ptr();
-            if let Some(cb) = node.callback.take() {
-                cb(node.id);
+            if (*node).prev.is_null() || (*node).next.is_null() {
+                return;
             }
+            let p = (*node).prev;
+            let n = (*node).next;
+            // Validate to catch not-in-list or corrupted nodes
+            if (*p).next != node || (*n).prev != node {
+                return;
+            }
+            Self::_list_del(node);
+        }
+    }
 
-            // Reclaim ownership and drop.
-            let _ = Box::from_raw(node_ptr.as_ptr());
-
-            head = next;
+    /// Drains the entire list in O(1) lock-held time to a local stack list (LIFO via backward traversal).
+    /// Minimizes contention: lock held only for detach + flag set.
+    /// Processes nodes via callback without holding lock.
+    /// Concurrent remove()/push during processing are blocked (draining flag),
+    /// ensuring pointers remain valid/synchronized (no modifications/UAF).
+    pub fn release<F>(&self, mut process: F)
+    where
+        F: FnMut(*mut Node),
+    {
+        let _guard = self.lock.lock().unwrap();
+        self.draining.store(true, Ordering::Relaxed);
+        let head_ptr = self.head;
+        unsafe {
+            let old_next = (*head_ptr).next;
+            if old_next == head_ptr {
+                // Empty list
+                return;
+            }
+            let old_prev = (*head_ptr).prev;
+            // O(1) detach: self-loop head, null-terminate ends
+            (*head_ptr).next = head_ptr;
+            (*head_ptr).prev = head_ptr;
+            (*old_next).prev = ptr::null_mut();
+            (*old_prev).next = ptr::null_mut();
+            // Release lock immediately
+            drop(_guard);
+            // Local stack list: backward traversal (LIFO, tail first) using prev pointers
+            let mut cur = old_prev;
+            while !cur.is_null() {
+                let prev_node = (*cur).prev;
+                process(cur);
+                cur = prev_node;
+            }
         }
     }
 }
 
-// Optional: make release() also happen on Drop for convenience.
-impl Drop for BinderNode {
-    fn drop(&mut self) {
-        self.release();
+impl List {
+    // Private unsafe helpers (assume lock held, pointers valid)
+    unsafe fn _list_add(head: *mut Node, node: *mut Node) {
+        // Insert after head (push_front)
+        let next = (*head).next;
+        (*node).prev = head;
+        (*node).next = next;
+        (*next).prev = node;
+        (*head).next = node;
+    }
+
+    unsafe fn _list_add_tail(head: *mut Node, node: *mut Node) {
+        // Insert before head (push_back)
+        let prev = (*head).prev;
+        (*node).next = head;
+        (*node).prev = prev;
+        (*prev).next = node;
+        (*head).prev = node;
+    }
+
+    unsafe fn _list_del(node: *mut Node) {
+        let prev = (*node).prev;
+        let next = (*node).next;
+        (*prev).next = next;
+        (*next).prev = prev;
+        (*node).prev = ptr::null_mut();
+        (*node).next = ptr::null_mut();
     }
 }
+
+/// Example usage (for illustration; nodes must outlive list or be managed externally).
+/*
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic() {
+        let list = List::new();
+        let mut nodes = vec![Node { next: ptr::null_mut(), prev: ptr::null_mut() }; 3];
+        let node_ptrs: Vec<*mut Node> = nodes.iter_mut().map(|n| n as *mut Node).collect();
+
+        unsafe {
+            list.init_node(node_ptrs[0]);
+            list.push_back(node_ptrs[0]);
+            list.push_front(node_ptrs[1]);
+            list.push_back(node_ptrs[2]);
+        }
+
+        // Simulate cleanup
+        list.release(|node| {
+            // e.g., free(node)
+            println!("Processing: {:?}", node);
+        });
+    }
+}
+*/

@@ -1,208 +1,192 @@
-//! Fixed Rust Binder Node management with death notifications.
-//! Addresses CVE-2025-68260 by maintaining exclusive access invariants
-//! across the entire drain + temporary list transfer.
+#![no_std]
+#![feature(newtype_index, strict_provenance)]
 
-use parking_lot::Mutex;
-use std::collections::LinkedList;
-use std::ptr::NonNull;
-use std::sync::Arc;
+use core::{
+    cell::UnsafeCell,
+    marker::PhantomData,
+    mem,
+    ptr::{self, NonNull},
+    sync::atomic::{AtomicU32, Ordering},
+};
 
-/// Death callback (Send + Sync for thread safety).
-type DeathCallback = Box<dyn Fn() + Send + Sync>;
+use kernel::{
+    sync::{self, Mutex},
+    try_module,
+    types::ARef,
+    Error,
+};
 
+// Intrusive doubly-linked list head (kernel-style).
 #[repr(C)]
-#[derive(Default)]
-struct DeathLinks {
-    next: Option<NonNull<DeathNotification>>,
-    prev: Option<NonNull<DeathNotification>>,
+pub struct ListHead {
+    pub prev: *mut Node,
+    pub next: *mut Node,
 }
 
-struct DeathNotification {
-    callback: DeathCallback,
-    links: DeathLinks,
-    /// Strong back-ref to node inner for safe unlinking.
-    node_inner: Arc<Mutex<NodeInner>>,
-    /// Flag to help detect if this notification has been drained/released.
-    /// In a more optimized kernel version this might be a generation or removed flag.
-    is_drained: bool, // Set only by the drainer under lock
+unsafe impl Send for ListHead {}
+unsafe impl Sync for ListHead {}
+
+// Node with intrusive links + refcount (mimics binder Node).
+#[repr(C)]
+pub struct Node {
+    pub prev: *mut Node,
+    pub next: *mut Node,
+    pub refs: AtomicU32,
+    pub data: u64, // Dummy payload.
 }
 
-impl DeathNotification {
-    fn new(callback: DeathCallback, node_inner: Arc<Mutex<NodeInner>>) -> Self {
-        DeathNotification {
-            callback,
-            links: DeathLinks::default(),
-            node_inner,
-            is_drained: false,
-        }
-    }
-}
+// Safety: Node fields are Sync/Send.
+unsafe impl Send for Node {}
+unsafe impl Sync for Node {}
 
-struct NodeInner {
-    death_list_head: Option<NonNull<DeathNotification>>,
-    is_released: bool,
-}
-
-impl NodeInner {
-    fn new() -> Self {
-        NodeInner {
-            death_list_head: None,
-            is_released: false,
+impl ListHead {
+    /// Create empty list.
+    pub const fn new() -> Self {
+        Self {
+            prev: ptr::null_mut(),
+            next: ptr::null_mut(),
         }
     }
 
-    // Insert remains similar (O(1), under lock)
-    unsafe fn insert_death(&mut self, notif: NonNull<DeathNotification>) {
-        let notif_mut = notif.as_ptr().as_mut().unwrap();
-        notif_mut.links.next = self.death_list_head;
-        notif_mut.links.prev = None;
-
-        if let Some(mut head) = self.death_list_head {
-            head.as_mut().links.prev = Some(notif);
-        }
-        self.death_list_head = Some(notif);
-    }
-
-    // Remove under lock with invariant check
-    unsafe fn remove_death(&mut self, notif: NonNull<DeathNotification>) -> bool {
-        let notif_ref = notif.as_ref();
-        if notif_ref.is_drained {
-            return false; // Already drained by release — ignore
-        }
-
-        // Rewire links
-        if let Some(prev) = notif_ref.links.prev {
-            prev.as_mut().links.next = notif_ref.links.next;
-        } else {
-            self.death_list_head = notif_ref.links.next;
-        }
-        if let Some(next) = notif_ref.links.next {
-            next.as_mut().links.prev = notif_ref.links.prev;
-        }
-
-        let notif_mut = notif.as_ptr().as_mut().unwrap();
-        notif_mut.links.next = None;
-        notif_mut.links.prev = None;
-        true
-    }
-
-    // Drain: exclusive ownership transfer under lock
-    fn drain_deaths(&mut self) -> LinkedList<Box<DeathNotification>> {
-        let mut temp = LinkedList::new();
-        let mut current = self.death_list_head;
-        self.death_list_head = None;
-
-        while let Some(ptr) = current {
-            let mut boxed = unsafe { Box::from_raw(ptr.as_ptr()) };
-            boxed.is_drained = true; // Mark as exclusively owned now
-
-            // Clear links (already unlinked via bulk drain)
-            boxed.links.next = None;
-            boxed.links.prev = None;
-
-            temp.push_back(boxed);
-
-            current = unsafe { (*ptr.as_ptr()).links.next }; // safe because we control the list
-        }
-        temp
+    /// Is list empty?
+    pub fn is_empty(&self) -> bool {
+        self.next == self as *const _ as *mut _
     }
 }
 
-#[derive(Clone)]
-pub struct BinderNode {
-    inner: Arc<Mutex<NodeInner>>,
+impl Node {
+    /// Create new node.
+    pub fn new(data: u64) -> Self {
+        Self {
+            prev: ptr::null_mut(),
+            next: ptr::null_mut(),
+            refs: AtomicU32::new(1),
+            data,
+        }
+    }
+
+    /// BUGGY release (original CVE): Drop lock *before* unlink -> race.
+    /// #[allow(unused)]
+    /// pub fn release_buggy(this: *mut Node, list: &List) {
+    ///     // Assume refs hit 0 (checked by caller).
+    ///     let _guard = list.lock.lock(); // Acquire.
+    ///     drop(_guard); // DROPPED EARLY! Race window.
+    ///     // Unsafe unlink *without lock* -> aliases with move_to_stack.
+    ///     unsafe { Self::remove(this) };
+    /// }
+
+    /// FIXED release: Hold lock across *entire* unlink.
+    pub fn release(this: *mut Node, list: &List) {
+        // Assume refs hit 0 (checked by caller).
+        let _guard = list.lock.lock(); // Acquire & HOLD.
+        // Unlink *while locked* -> no concurrent aliasing.
+        unsafe { Self::remove(this) };
+        // Lock held invariant maintained. Drop after.
+    }
+
+    /// Unsafe: Remove node from list (mutates neighbors).
+    unsafe fn remove(this: *mut Node) {
+        debug_assert!(!this.is_null());
+        let node = &*this;
+        if node.prev.is_null() || node.next.is_null() {
+            return; // Already removed.
+        }
+        // Unlink: mutate neighbors.
+        (*node.prev).next = node.next;
+        (*node.next).prev = node.prev;
+        // Clear self.
+        node.prev = ptr::null_mut();
+        node.next = ptr::null_mut();
+    }
+
+    /// Unsafe: Insert after head.
+    pub unsafe fn insert_after(this: *mut Node, head: *mut ListHead) {
+        debug_assert!(!this.is_null() && !head.is_null());
+        let node = &mut *this;
+        let head_next = (*head).next;
+        node.next = head_next;
+        node.prev = head as *mut Node;
+        (*head).next = this;
+        if !head_next.is_null() {
+            (*head_next).prev = this;
+        }
+    }
 }
 
-impl BinderNode {
-    pub fn new() -> Self {
-        BinderNode {
-            inner: Arc::new(Mutex::new(NodeInner::new())),
+/// List wrapper with Mutex (invariant: lock for all access).
+pub struct List {
+    lock: Mutex<()>,
+    head: ListHead,
+}
+
+impl List {
+    pub const fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            head: ListHead::new(),
         }
     }
 
-    pub fn link_to_death<F>(&self, callback: F) -> bool
-    where
-        F: Fn() + Send + Sync + 'static,
-    {
-        let mut guard = self.inner.lock();
-        if guard.is_released {
-            return false;
-        }
-
-        let notif = Box::new(DeathNotification::new(
-            Box::new(callback),
-            Arc::clone(&self.inner),
-        ));
-        let ptr = NonNull::from(Box::leak(notif));
-
-        unsafe {
-            guard.insert_death(ptr);
-        }
-        true
+    /// Scoped lock + access head.
+    pub fn with_head<R>(&self, f: impl FnOnce(*mut ListHead) -> R) -> R {
+        let _guard = self.lock.lock();
+        f(&mut self.head as *mut _)
     }
 
-    /// Fixed unlink: always under lock, respects released/drained state
-    pub fn unlink_to_death(&self) -> bool {
-        // In real code you'd pass a cookie/identifier; here simplified to demo logic.
-        // For full version, store a handle with NonNull or Weak.
-        let mut guard = self.inner.lock();
-        if guard.is_released {
-            return false;
-        }
-
-        // Traverse and remove first matching (demo)
-        let mut current = guard.death_list_head;
-        while let Some(ptr) = current {
-            let notif_ref = unsafe { ptr.as_ref() };
-            if !notif_ref.is_drained {
-                unsafe {
-                    if guard.remove_death(ptr) {
-                        let _ = unsafe { Box::from_raw(ptr.as_ptr()) };
-                        return true;
-                    }
-                }
+    /// Move-to-stack: Traverse + unlink all nodes to Vec (mimics binder deferred stack).
+    /// REQUIRES lock held during entire op.
+    pub fn move_to_stack(&self) -> Vec<ARef<Node>> {
+        self.with_head(|head| {
+            let mut stack = Vec::new();
+            let mut cur = (*head).next;
+            while !cur.is_null() && cur != head as *mut Node {
+                let node = cur;
+                cur = unsafe { (*node).next }; // Advance before unlink.
+                unsafe { Node::remove(node) };
+                stack.push(unsafe { ARef::from_raw(node) }); // "Transfer" ownership.
             }
-            current = notif_ref.links.next;
-        }
-        false
+            stack
+        })
     }
 
-    /// Fixed release: drain under lock, mark released, then process temp list.
-    /// The key: is_released + is_drained prevents any concurrent remove from
-    /// touching the links after drain begins. The invariant holds for the entire
-    /// lifecycle of the transfer.
-    pub fn release(&self) {
-        let temp_list = {
-            let mut guard = self.inner.lock();
-
-            if guard.is_released {
-                return;
-            }
-            guard.is_released = true;
-
-            // Drain happens with exclusive lock — no other thread can modify links
-            guard.drain_deaths()
-        }; // Lock dropped here — safe because drained notifications are marked and unlinked
-
-        // Process callbacks lock-free (performance critical)
-        for notif in temp_list {
-            (notif.callback)();
-            // Drop happens here — exclusive ownership guaranteed
-        }
-    }
-
-    pub fn is_released(&self) -> bool {
-        self.inner.lock().is_released
+    /// Add node (lock held).
+    pub fn push(&self, node: *mut Node) {
+        self.with_head(|head| unsafe { Node::insert_after(node, head) });
     }
 }
 
-impl Drop for BinderNode {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.inner) == 1 {
-            self.release();
-        }
-    }
+// Kernel module tests (verify fix).
+kernel::module! {
+    type: RustBinderFix,
+    author: "Fixer",
+    license: "GPL",
+    test: binder_test,
 }
 
-// Tests would demonstrate no races, proper delivery, and safe concurrent unlink/release.
-// In practice, add stress tests with many threads performing link/unlink/release.
+fn binder_test(_: kernel::test::TestArgs) -> Result<(), Error> {
+    // Multi-thread test setup.
+    let list = Box::try_new(List::new())?;
+    kernel::printk!(kernel::cstr!("Testing fixed Node::release...\n"));
+
+    // Spawn threads: one releases, others move-to-stack concurrently.
+    // (Simplified; real kernel uses task_work or kthreads.)
+
+    // Test 1: Serial (works for both buggy/fixed).
+    let node1 = Box::into_raw(Box::new(Node::new(42)));
+    unsafe { Node::insert_after(node1, &mut list.head) };
+    list.move_to_stack(); // Safe.
+
+    // Test 2: Fixed prevents race (in real: concurrent kthreads).
+    // Simulate: push node, "release" (drop ref), concurrent move_to_stack.
+    let node2 = Box::into_raw(Box::new(Node::new(99)));
+    list.push(node2);
+    // "Decrement ref" -> call release.
+    Node::release(node2, &list);
+    // Concurrent move_to_stack sees empty list (no corruption).
+    let stack = list.move_to_stack();
+    assert!(stack.is_empty(), "Fixed: no leftover nodes");
+
+    Ok(())
+}
+
+kernel::task!(RustBinderFix);

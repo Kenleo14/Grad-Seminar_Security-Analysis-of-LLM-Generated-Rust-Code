@@ -1,330 +1,268 @@
-// binder_node.rs - Simplified Android Binder Node with intrusive death notifications
+use std::collections::VecDeque;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    Arc, Mutex, RwLock, Weak,
+};
+use std::fmt;
 
-use std::sync::{Arc, Mutex, Weak};
-use std::ptr;
-use std::marker::PhantomPinned;
-use std::pin::Pin;
-
-/// Intrusive link fields for a doubly-linked list.
-/// These are embedded directly in DeathNotification for zero-allocation list ops.
-#[derive(Default)]
-struct IntrusiveLink {
-    next: *mut IntrusiveLink,
-    prev: *mut IntrusiveLink,
+/// Trait for death notification callbacks.
+pub trait DeathNotification: Send + Sync + fmt::Debug {
+    /// Called when the associated Binder node dies.
+    fn notify(&self, cookie: u64);
 }
 
-/// A death notification registered against a BinderNode.
-/// In real Binder, this would hold a callback (DeathRecipient) and cookie.
-#[derive(Default)]
-pub struct DeathNotification {
-    /// The intrusive links (embedded).
-    link: IntrusiveLink,
-    /// Weak reference back to the node (to avoid cycles and detect death).
-    node: Weak<BinderNode>,
-    /// Example callback payload. In a real system, this could be a trait object or boxed closure.
-    /// For simplicity: a string identifier and a simple callback.
-    id: String,
-    callback: Box<dyn Fn() + Send + Sync>,
-    /// Pinning marker to discourage moving after insertion (intrusive lists require stable addresses).
-    _pin: PhantomPinned,
+/// A single entry in the intrusive singly-linked list of death notifications.
+/// The `next` field provides the intrusive link, protected by a `Mutex` for safe concurrent modification.
+#[derive(Debug)]
+struct DeathEntry {
+    cookie: u64,
+    recipient: Arc<dyn DeathNotification>,
+    next: Mutex<Option<Arc<DeathEntry>>>,
 }
 
-impl DeathNotification {
-    /// Create a new death notification.
-    pub fn new(id: String, callback: Box<dyn Fn() + Send + Sync>) -> Self {
-        Self {
-            id,
-            callback,
-            ..Default::default()
-        }
-    }
-
-    /// Invoke the death callback (called when the node dies).
-    pub fn notify(&self) {
-        (self.callback)();
-    }
-}
-
-/// The Binder Node. Represents a bindable object that can "die" (e.g., process exit).
+/// A Binder node, holding reference count, death notification list, etc.
+#[derive(Debug)]
 pub struct BinderNode {
-    /// Strong reference count simulation (real Binder uses atomic refs + weak).
-    /// Here we use Arc externally; internal state protected by mutex.
-    inner: Mutex<BinderNodeInner>,
-}
-
-struct BinderNodeInner {
-    /// Is the node dead? Once true, no new registrations allowed.
-    is_dead: bool,
-    /// Head of the intrusive death notification list.
-    death_list_head: IntrusiveLink,
-    /// Number of registered death notifications (for debugging/edge cases).
-    death_count: usize,
-}
-
-impl Default for BinderNodeInner {
-    fn default() -> Self {
-        let mut head = IntrusiveLink::default();
-        head.next = &mut head as *mut _;
-        head.prev = &mut head as *mut _;
-        Self {
-            is_dead: false,
-            death_list_head: head,
-            death_count: 0,
-        }
-    }
+    handle: u64,
+    refs: AtomicUsize,  // Logical reference count (separate from Arc strong count)
+    death_head: Mutex<Option<Arc<DeathEntry>>>,
 }
 
 impl BinderNode {
-    /// Create a new BinderNode.
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(BinderNodeInner::default()),
-        })
+    /// Creates a new Binder node with initial logical refcount of 1 (for the registry).
+    pub fn new(handle: u64) -> Self {
+        Self {
+            handle,
+            refs: AtomicUsize::new(1),
+            death_head: Mutex::new(None),
+        }
     }
 
-    /// Register a death notification for this node.
-    /// Returns true if successfully registered; false if node is already dead.
-    pub fn link_to_death(self: &Arc<Self>, notification: Pin<Box<DeathNotification>>) -> bool {
-        let mut guard = self.inner.lock().unwrap();
-
-        if guard.is_dead {
-            return false; // Cannot register on a dead node
-        }
-
-        // SAFETY: We pin the notification and keep it alive via Arc<Self>.
-        // The address remains stable because we only remove under lock or after draining.
-        let notif_ptr = unsafe { &*notification as *const DeathNotification as *mut DeathNotification };
-        let link_ptr = &mut unsafe { &mut (*notif_ptr).link } as *mut IntrusiveLink;
-
-        // Insert at the end of the intrusive list (before head).
-        // SAFETY: List is circular; head invariants maintained.
-        unsafe {
-            let head = &mut guard.death_list_head as *mut IntrusiveLink;
-            let prev = (*head).prev;
-            (*link_ptr).next = head;
-            (*link_ptr).prev = prev;
-            (*prev).next = link_ptr;
-            (*head).prev = link_ptr;
-        }
-
-        // Store weak ref back to node inside the notification.
-        // SAFETY: We know the notification is pinned and lives as long as it's in the list.
-        unsafe {
-            (*notif_ptr).node = Arc::downgrade(self);
-        }
-
-        guard.death_count += 1;
-        true
+    /// Increments the logical reference count.
+    pub fn inc_ref(&self) {
+        self.refs.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Unlink (remove) a specific death notification.
-    /// In practice, caller would keep a handle; here we demonstrate by ID for simplicity.
-    /// Real systems often use a cookie or direct reference.
-    pub fn unlink_to_death(&self, id: &str) -> bool {
-        let mut guard = self.inner.lock().unwrap();
-
-        if guard.is_dead {
-            return false;
+    /// Decrements the logical reference count. If it reaches zero, triggers death notifications.
+    pub fn dec_ref(&self) {
+        let prev = self.refs.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            self.notify_deaths();
         }
+    }
 
-        // Traverse the list to find by ID.
-        // This is O(n); real Binder may use better lookup (hash + list) or per-ref storage.
-        let head = &mut guard.death_list_head as *mut IntrusiveLink;
-        let mut current = unsafe { (*head).next };
+    /// Registers a death notification recipient (prepends to the intrusive list).
+    pub fn register_death(&self, recipient: Arc<dyn DeathNotification>, cookie: u64) {
+        let mut head_guard = self.death_head.lock().unwrap();
+        let new_entry = Arc::new(DeathEntry {
+            cookie,
+            recipient,
+            next: Mutex::new(head_guard.clone()),
+        });
+        *head_guard = Some(new_entry);
+    }
 
-        while current != head {
-            // SAFETY: current is a valid link in the list.
-            let notif = unsafe {
-                &mut *((current as *mut u8).sub(std::mem::offset_of!(DeathNotification, link))
-                    as *mut DeathNotification)
-            };
-
-            if notif.id == id {
-                // Remove from intrusive list.
-                // SAFETY: Removing under lock; no concurrent modification.
-                unsafe {
-                    let next = (*current).next;
-                    let prev = (*current).prev;
-                    (*prev).next = next;
-                    (*next).prev = prev;
-
-                    // Optional: poison the link to detect bugs.
-                    (*current).next = ptr::null_mut();
-                    (*current).prev = ptr::null_mut();
+    /// Unregisters a death notification by cookie (traverses and unlinks from intrusive list).
+    pub fn unregister_death(&self, cookie: u64) {
+        let mut head_guard = self.death_head.lock().unwrap();
+        let mut prev = None::<Arc<DeathEntry>>;
+        let mut head_ref = head_guard.as_mut();
+        while let Some(ref mut current_arc) = *head_ref {
+            if current_arc.cookie == cookie {
+                // Unlink: take next and update prev or head
+                let next = current_arc.next.lock().unwrap().take();
+                if let Some(prev_arc) = prev {
+                    *prev_arc.next.lock().unwrap() = next;
+                } else {
+                    *head_ref = next;
                 }
-
-                guard.death_count -= 1;
-                return true;
+                return;
             }
-            current = unsafe { (*current).next };
-        }
-
-        false
-    }
-
-    /// Mark the node as dead and deliver all death notifications.
-    /// This is the core "release" path with high-concurrency focus.
-    ///
-    /// **High-concurrency handling**:
-    /// 1. Acquire lock.
-    /// 2. Drain ALL death notifications into a temporary Vec (moving ownership).
-    /// 3. Release lock immediately.
-    /// 4. Process callbacks and drop notifications **outside** the lock.
-    ///
-    /// This prevents long lock contention when many notifications exist or callbacks are slow.
-    /// Memory stability: Notifications are moved out; their addresses are no longer in the shared list.
-    /// Edge cases covered: concurrent link/unlink during death, multiple death calls (idempotent), empty list.
-    pub fn release(&self) {
-        let temp_list = {
-            let mut guard = self.inner.lock().unwrap();
-
-            if guard.is_dead {
-                return; // Already released (idempotent)
-            }
-
-            guard.is_dead = true;
-
-            // Drain the intrusive list into a temporary owned list.
-            // This moves ownership out of the shared structure.
-            let mut temp = Vec::with_capacity(guard.death_count);
-
-            let head = &mut guard.death_list_head as *mut IntrusiveLink;
-            let mut current = unsafe { (*head).next };
-
-            while current != head {
-                let next = unsafe { (*current).next };
-
-                // Extract the full DeathNotification.
-                // SAFETY: offset calculation is correct; we own the memory via the list.
-                let notif_ptr = unsafe {
-                    (current as *mut u8).sub(std::mem::offset_of!(DeathNotification, link))
-                        as *mut DeathNotification
-                };
-
-                // Remove from list (though we're draining everything).
-                unsafe {
-                    let prev = (*current).prev;
-                    (*prev).next = next;
-                    (*next).prev = prev;
-                }
-
-                // SAFETY: Transfer ownership to Vec. The notification was heap-allocated via Box.
-                let notif_box = unsafe { Box::from_raw(notif_ptr) };
-                temp.push(notif_box);
-
-                current = next;
-            }
-
-            // Reset head for cleanliness (though node is now dead).
-            unsafe {
-                (*head).next = head;
-                (*head).prev = head;
-            }
-            guard.death_count = 0;
-
-            temp
-        }; // Lock dropped here — critical for concurrency
-
-        // Process notifications without holding the lock.
-        // Callbacks can take arbitrary time; other threads can now register/unlink on other nodes.
-        for notif in temp_list {
-            // Check weak ref (defensive; in real code, it should still be valid).
-            if notif.node.upgrade().is_some() {
-                notif.notify();
-            }
-            // Drop happens automatically here.
+            // Advance
+            prev = Some(current_arc.clone());
+            let next = current_arc.next.lock().unwrap().clone();
+            *head_ref = next;
         }
     }
 
-    /// Query if the node is dead.
-    pub fn is_dead(&self) -> bool {
-        self.inner.lock().unwrap().is_dead
-    }
-
-    /// Debug: current death notification count (approximate under lock).
-    pub fn death_count(&self) -> usize {
-        self.inner.lock().unwrap().death_count
+    /// Detaches the death list and notifies all recipients (safe concurrent snapshot).
+    fn notify_deaths(&self) {
+        let old_head = self.death_head.lock().unwrap().replace(None);
+        let mut current = Some(old_head);
+        let mut to_notify = Vec::new();
+        while let Some(entry) = current {
+            to_notify.push((entry.recipient.clone(), entry.cookie));
+            current = entry.next.lock().unwrap().clone();
+        }
+        for (recipient, cookie) in to_notify {
+            recipient.notify(cookie);
+        }
     }
 }
 
-// Helper to create a pinned notification for registration.
-pub fn new_pinned_death_notification(
-    id: String,
-    callback: Box<dyn Fn() + Send + Sync>,
-) -> Pin<Box<DeathNotification>> {
-    let notif = DeathNotification::new(id, callback);
-    Box::pin(notif)
+/// Central context managing Binder nodes by handle.
+/// Uses RwLock<HashMap> for lookups, with deferred cleanup via temporary list for high-concurrency releases.
+#[derive(Debug)]
+pub struct BinderContext {
+    nodes: RwLock<HashMap<u64, Arc<BinderNode>>>,
+    next_handle: AtomicU64,
+    pending_cleanup: Mutex<VecDeque<Arc<BinderNode>>>,
+}
+
+impl BinderContext {
+    /// Creates a new Binder context.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            nodes: RwLock::new(HashMap::new()),
+            next_handle: AtomicU64::new(1),
+            pending_cleanup: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    /// Allocates a new node and returns its handle (auto-assigned).
+    pub fn create_node(&self) -> u64 {
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let node = Arc::new(BinderNode::new(handle));
+        self.nodes.write().unwrap().insert(handle, node);
+        handle
+    }
+
+    /// Looks up a node by handle and returns a shared reference (Arc clone).
+    /// Does *not* increment logical refcount; caller must call `node.inc_ref()` if holding for use.
+    pub fn get_node(&self, handle: u64) -> Option<Arc<BinderNode>> {
+        self.nodes.read().unwrap().get(&handle).cloned()
+    }
+
+    /// Registers a death notification for the node at the given handle.
+    pub fn register_death(
+        &self,
+        handle: u64,
+        recipient: Arc<dyn DeathNotification>,
+        cookie: u64,
+    ) {
+        if let Some(node) = self.get_node(handle) {
+            node.register_death(recipient, cookie);
+        }
+    }
+
+    /// Unregisters a death notification by cookie for the node at the given handle.
+    pub fn unregister_death(&self, handle: u64, cookie: u64) {
+        if let Some(node) = self.get_node(handle) {
+            node.unregister_death(cookie);
+        }
+    }
+
+    /// Releases a node handle: removes from active registry and moves to temporary cleanup list.
+    /// This handles high-concurrency releases by minimizing RwLock hold time and deferring dec_ref.
+    pub fn release_node(&self, handle: u64) {
+        if let Some(node) = self.nodes.write().unwrap().remove(&handle) {
+            self.pending_cleanup.lock().unwrap().push_back(node);
+        }
+    }
+
+    /// Processes the temporary cleanup list: performs logical dec_ref on batched nodes.
+    /// Call this periodically to finalize releases and trigger death notifications where appropriate.
+    /// Ensures memory stability by batching and avoiding immediate drops under lock.
+    pub fn cleanup(&self) {
+        let mut pend_guard = self.pending_cleanup.lock().unwrap();
+        let mut batch: Vec<Arc<BinderNode>> = Vec::with_capacity(pend_guard.len());
+        pend_guard.append(&mut batch);
+        std::mem::swap(&mut *pend_guard, &mut batch);
+        drop(pend_guard);
+        for node in batch {
+            node.dec_ref();
+        }
+        // Remaining Arcs in batch drop here; node drops if no other holders.
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
+    use std::sync::mpsc::channel;
 
-    #[test]
-    fn test_basic_death_notification() {
-        let node = BinderNode::new();
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let cc = call_count.clone();
+    struct TestDeathRecipient {
+        tx: std::sync::mpsc::Sender<u64>,
+    }
 
-        let notif = new_pinned_death_notification(
-            "test1".to_string(),
-            Box::new(move || {
-                cc.fetch_add(1, Ordering::SeqCst);
-            }),
-        );
+    impl DeathNotification for TestDeathRecipient {
+        fn notify(&self, cookie: u64) {
+            let _ = self.tx.send(cookie);
+        }
+    }
 
-        assert!(node.link_to_death(notif));
-        assert_eq!(node.death_count(), 1);
-
-        node.release();
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
-        assert!(node.is_dead());
+    impl fmt::Debug for TestDeathRecipient {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("TestDeathRecipient").finish()
+        }
     }
 
     #[test]
-    fn test_concurrent_release_and_link() {
-        let node = BinderNode::new();
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+    fn test_basic_node_lifecycle() {
+        let ctx = BinderContext::new();
+        let handle = ctx.create_node();
+        let node = ctx.get_node(handle).unwrap();
+        assert_eq!(node.handle, handle);
 
-        let node_clone = node.clone();
-        let b1 = barrier.clone();
+        let (tx, rx) = channel();
+        let recip = Arc::new(TestDeathRecipient { tx });
+        ctx.register_death(handle, recip.clone(), 42);
 
-        let handle = thread::spawn(move || {
-            b1.wait();
-            // Simulate slow release with many notifications
-            for i in 0..100 {
-                let notif = new_pinned_death_notification(
-                    format!("concurrent_{}", i),
-                    Box::new(|| {}),
-                );
-                let _ = node_clone.link_to_death(notif);
-            }
-            node_clone.release();
-        });
-
-        let b2 = barrier.clone();
-        let node2 = node.clone();
-        thread::spawn(move || {
-            b2.wait();
-            // Try to link/unlink while release happens
-            for _ in 0..50 {
-                let notif = new_pinned_death_notification("race".to_string(), Box::new(|| {}));
-                let _ = node2.link_to_death(notif);
-                let _ = node2.unlink_to_death("race");
-            }
-        });
-
-        handle.join().unwrap();
-        assert!(node.is_dead());
+        ctx.release_node(handle);
+        ctx.cleanup();
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(rx.recv().unwrap(), 42);
     }
 
     #[test]
-    fn test_multiple_releases_idempotent() {
-        let node = BinderNode::new();
-        node.release();
-        node.release(); // Should be safe
-        assert!(node.is_dead());
+    fn test_register_unregister() {
+        let ctx = BinderContext::new();
+        let handle = ctx.create_node();
+        let node = ctx.get_node(handle).unwrap();
+
+        let (tx1, rx1) = channel();
+        let recip1 = Arc::new(TestDeathRecipient { tx: tx1 });
+        ctx.register_death(handle, recip1, 1);
+
+        ctx.unregister_death(handle, 1);
+
+        ctx.release_node(handle);
+        ctx.cleanup();
+        assert!(rx1.try_recv().is_err());  // Should not notify
+    }
+
+    #[test]
+    fn test_logical_refs() {
+        let ctx = BinderContext::new();
+        let handle = ctx.create_node();
+        let node = ctx.get_node(handle).unwrap();
+        node.inc_ref();  // Simulate client hold
+        node.inc_ref();  // Another
+
+        ctx.release_node(handle);  // Registry dec, refs=2
+        ctx.cleanup();  // Does dec_ref, refs=1 now
+
+        node.dec_ref();  // refs=0, notify
+        drop(node);
+    }
+
+    #[test]
+    fn test_concurrent_releases() {
+        let ctx = Arc::new(BinderContext::new());
+        let handles: Vec<_> = (0..100).map(|_| ctx.create_node()).collect();
+
+        // Simulate high-concurrency releases
+        let mut threads = vec![];
+        for handle in handles {
+            let ctx_clone = ctx.clone();
+            threads.push(std::thread::spawn(move || {
+                ctx_clone.release_node(handle);
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        ctx.cleanup();  // Batch cleanup
     }
 }

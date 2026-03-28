@@ -1,262 +1,182 @@
-//! Simplified Android Binder Node Management System
-//!
-//! This module implements a simplified version of Android Binder's node management,
-//! focusing on death notification tracking using an **intrusive linked list**.
-//! It closely models the Linux kernel Binder driver's approach to `binder_node`
-//! death recipients (see `binder_ref_death` and per-node `death_list` handling).
-//!
-//! ## Key Design Goals (as requested)
-//! - **Intrusive linked list** for death notifications: No separate list-node allocations;
-//!   each `DeathNotification` embeds its own `next`/`prev` pointers. This matches
-//!   kernel efficiency (zero-overhead linking).
-//! - **High-concurrency releases**: When releasing a `BinderNode`, all death-notification
-//!   nodes are **moved atomically to a temporary list** *under lock*. The lock is
-//!   released *before* executing callbacks. This prevents long-held locks during
-//!   potentially slow/arbitrary user callbacks and eliminates lock contention for
-//!   other threads.
-//! - **Memory stability during concurrent access**: The temporary list *owns* the
-//!   raw pointers (via `Box::into_raw` / `Box::from_raw`). Once moved, the source
-//!   list head is cleared, guaranteeing that no other thread can mutate or free
-//!   the nodes while the temporary list is being processed. Pointers remain valid
-//!   until explicit cleanup after callbacks complete — preventing use-after-free
-//!   even under heavy contention.
-//!
-//! ## How It Mirrors Real Android Binder
-//! In the kernel, death notifications are spliced into a temporary list (via
-//! `list_move` / `list_splice`) under the node lock, the lock is dropped, and
-//! the temp list is walked for `binder_death` callbacks. This Rust version
-//! achieves the same pattern safely using Rust's ownership model + controlled `unsafe`.
-//!
-//! ## Thread Safety & Concurrency Guarantees
-//! - All list mutations are protected by a `Mutex`.
-//! - Release path holds the lock for O(1) time (just a pointer swap).
-//! - Callbacks run completely lock-free.
-//! - Multiple concurrent `register_death_notification` + `release` operations are safe;
-//!   the move-to-temp is atomic with respect to the list head.
-//!
-//! ## Limitations (Simplified)
-//! - No full Binder IPC, transaction handling, or reference counting on nodes.
-//! - Single-node focus (real Binder has a global node tree).
-//! - Callbacks are `FnOnce() + Send + 'static` (no arguments or return values).
-//! - No unregister support (real Binder supports it via explicit removal).
-//! - Panic in a callback does *not* poison the mutex (lock already released) but
-//!   will unwind only that notification; remaining notifications still execute.
+use std::collections::HashMap;
+use std::mem;
+use std::ptr;
+use std::sync::{Arc, Mutex, RwLock, atomic::{AtomicUsize, Ordering}};
 
-use std::marker::PhantomData;
-use std::ptr::NonNull;
-use std::sync::Mutex;
-
-/// Internal death notification entry. This is the **intrusive list node**.
-/// Links (`next`/`prev`) are embedded directly — zero extra allocation.
-struct DeathNotification {
-    next: Option<NonNull<DeathNotification>>,
-    prev: Option<NonNull<DeathNotification>>,
-    callback: Box<dyn FnOnce() + Send + 'static>,
+#[repr(C)]
+pub struct ListHead {
+    pub next: *mut ListHead,
+    pub prev: *mut ListHead,
 }
 
-impl DeathNotification {
-    fn new(callback: Box<dyn FnOnce() + Send + 'static>) -> Self {
-        Self {
-            next: None,
-            prev: None,
-            callback,
-        }
+impl ListHead {
+    pub fn new() -> ListHead {
+        let mut head = ListHead {
+            next: ptr::null_mut(),
+            prev: ptr::null_mut(),
+        };
+        head.init();
+        head
+    }
+
+    pub fn init(&mut self) {
+        self.next = self;
+        self.prev = self;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.next == self
+    }
+
+    pub unsafe fn list_add(new: *mut ListHead, head: *mut ListHead) {
+        let next = (*head).next;
+        (*next).prev = new;
+        (*new).next = next;
+        (*new).prev = head;
+        (*head).next = new;
+    }
+
+    pub unsafe fn list_del(entry: *mut ListHead) {
+        let prev = (*entry).prev;
+        let next = (*entry).next;
+        (*next).prev = prev;
+        (*prev).next = next;
+        // Optional poisoning
+        (*entry).next = ptr::null_mut();
+        (*entry).prev = ptr::null_mut();
     }
 }
 
-/// Intrusive doubly-linked list head that *owns* its nodes via raw pointers.
-/// Ownership is transferred with `Box::into_raw` / `Box::from_raw`.
-/// The `PhantomData` marks that the list conceptually owns `Box<DeathNotification>`.
-struct IntrusiveDeathList {
-    head: Option<NonNull<DeathNotification>>,
-    _phantom: PhantomData<Box<DeathNotification>>,
+#[repr(C)]
+pub struct DeathNotification {
+    pub cookie: usize,
+    pub list: ListHead,
 }
 
-impl IntrusiveDeathList {
-    fn new() -> Self {
-        Self {
-            head: None,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Push a notification into the front of the list (intrusive insert).
-    fn push(&mut self, notification: DeathNotification) {
-        let node = NonNull::new(Box::into_raw(Box::new(notification)))
-            .expect("Box::into_raw never returns null");
-        unsafe { self.insert(node) };
-    }
-
-    /// Intrusive insert at head (doubly-linked).
-    /// # Safety
-    /// Caller must ensure `node` points to a valid, exclusively owned `DeathNotification`
-    /// that is not already linked elsewhere.
-    unsafe fn insert(&mut self, node: NonNull<DeathNotification>) {
-        let node_ptr = node.as_ptr();
-
-        if let Some(mut head) = self.head {
-            // Link new node before current head
-            let head_ref = head.as_mut();
-            head_ref.prev = Some(node);
-
-            let node_ref = &mut *node_ptr;
-            node_ref.next = Some(head);
-            node_ref.prev = None;
-
-            self.head = Some(node);
-        } else {
-            // First node
-            let node_ref = &mut *node_ptr;
-            node_ref.next = None;
-            node_ref.prev = None;
-            self.head = Some(node);
-        }
-    }
-
-    /// Atomically move the *entire* list to a new temporary list.
-    /// This is the core primitive for high-concurrency release.
-    /// After this call the original list is empty.
-    fn take_all(&mut self) -> Self {
-        let mut temp = Self::new();
-        std::mem::swap(&mut self.head, &mut temp.head);
-        temp
-    }
-
-    /// Consume the list, execute every callback, then drop the nodes.
-    /// This runs **outside any lock** for maximum concurrency.
-    fn notify_all(self) {
-        let mut current = self.head;
-
-        while let Some(node_ptr) = current {
-            // Read next *before* any mutation or drop
-            let next = unsafe { (*node_ptr.as_ptr()).next };
-
-            // Extract and call callback
-            let node_mut = unsafe { &mut *node_ptr.as_ptr() };
-            let callback = std::mem::replace(&mut node_mut.callback, Box::new(|| {}));
-            callback();
-
-            // Advance and drop the node (reconstruct Box)
-            current = next;
-            let _ = unsafe { Box::from_raw(node_ptr.as_ptr()) };
-        }
-    }
-}
-
-/// A Binder node that can register death notifications and be released safely
-/// under high contention.
 pub struct BinderNode {
-    id: u32,
-    /// Protected intrusive list of death notifications.
-    death_list: Mutex<IntrusiveDeathList>,
-    /// Simple alive flag to prevent double-release and post-death registration races.
-    is_alive: Mutex<bool>,
+    pub ptr: usize,
+    handle: u32,
+    refs: AtomicUsize,
+    death_list: Mutex<ListHead>,
 }
 
 impl BinderNode {
-    /// Create a new Binder node.
-    pub fn new(id: u32) -> Self {
+    pub fn new(ptr: usize, handle: u32) -> Self {
         Self {
-            id,
-            death_list: Mutex::new(IntrusiveDeathList::new()),
-            is_alive: Mutex::new(true),
+            ptr,
+            handle,
+            refs: AtomicUsize::new(1),
+            death_list: Mutex::new(ListHead::new()),
         }
     }
 
-    /// Register a death notification callback.
-    ///
-    /// If the node has already been released, the callback is invoked immediately
-    /// (mimicking Binder's "already dead" behavior).
-    pub fn register_death_notification<F>(&self, callback: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        let mut alive_guard = self.is_alive.lock().unwrap();
-        if !*alive_guard {
-            // Node already dead → fire callback immediately (no lock contention)
-            let _ = Box::new(callback)();
-            return;
-        }
-        // Release alive lock before acquiring death_list lock (avoids deadlock)
-        drop(alive_guard);
-
-        let notification = DeathNotification::new(Box::new(callback));
-        let mut list_guard = self.death_list.lock().unwrap();
-        list_guard.push(notification);
+    pub fn inc_ref(&self) {
+        self.refs.fetch_add(1, Ordering::Release);
     }
 
-    /// Release the Binder node.
-    ///
-    /// **High-concurrency path**:
-    /// 1. Mark node dead under `is_alive` lock.
-    /// 2. Under `death_list` lock: move entire intrusive list to a *temporary list*.
-    /// 3. Release both locks.
-    /// 4. Process the temporary list (callbacks + cleanup) *lock-free*.
-    ///
-    /// This guarantees:
-    /// - Lock hold time is minimal (pointer swap only).
-    /// - Memory stability: temporary list owns all `NonNull` pointers; source list is emptied atomically.
-    /// - No other thread can observe or modify the nodes being cleaned up.
-    pub fn release(&self) {
-        // Mark dead (prevents further registrations)
+    pub fn dec_ref(&self) -> bool {
+        self.refs.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+
+    pub fn add_death_notification(&self, cookie: usize) {
+        let raw_dn: *mut DeathNotification = Box::into_raw(Box::new(DeathNotification {
+            cookie,
+            list: ListHead::new(),
+        }));
+        let list_offset = mem::offset_of!(DeathNotification, list);
+        let list_ptr = unsafe { (raw_dn as *mut u8).add(list_offset) as *mut ListHead };
+        let mut guard = self.death_list.lock().unwrap();
+        let head_ptr = &mut *guard as *mut ListHead;
+        unsafe { ListHead::list_add(list_ptr, head_ptr) };
+    }
+}
+
+pub struct BinderManager {
+    nodes: RwLock<HashMap<u32, *mut BinderNode>>,
+    cleanup_queue: Mutex<Vec<*mut BinderNode>>,
+}
+
+unsafe impl Send for BinderNode {}
+unsafe impl Sync for BinderNode {}
+
+impl BinderManager {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            nodes: RwLock::new(HashMap::new()),
+            cleanup_queue: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn create_node(&self, handle: u32, ptr: usize) -> *mut BinderNode {
+        let node = Box::new(BinderNode::new(ptr, handle));
+        let nptr = Box::into_raw(node);
+        self.nodes.write().unwrap().insert(handle, nptr);
+        nptr
+    }
+
+    pub fn acquire_node(&self, handle: u32) -> Option<*mut BinderNode> {
+        let nptr = {
+            let guard = self.nodes.read().unwrap();
+            guard.get(&handle).copied().unwrap_or(ptr::null_mut())
+        };
+        if nptr.is_null() {
+            return None;
+        }
+        let node = unsafe { &*nptr };
+        if node.refs.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        node.inc_ref();
+        Some(nptr)
+    }
+
+    pub fn release_ref(&self, nptr: *mut BinderNode) {
+        let node = unsafe { &*nptr };
+        if node.dec_ref() {
+            // Remove from map before enqueuing
+            self.nodes.write().unwrap().remove(&node.handle);
+            let mut queue = self.cleanup_queue.lock().unwrap();
+            queue.push(nptr);
+        }
+    }
+
+    pub fn release_handle(&self, handle: u32) {
+        let nptr_opt = {
+            let mut guard = self.nodes.write().unwrap();
+            guard.remove(&handle)
+        };
+        if let Some(nptr) = nptr_opt {
+            self.release_ref(nptr);
+        }
+    }
+
+    pub fn process_cleanup(&self) {
+        let batch: Vec<*mut BinderNode>;
         {
-            let mut alive_guard = self.is_alive.lock().unwrap();
-            if !*alive_guard {
-                return; // already released
+            let mut queue = self.cleanup_queue.lock().unwrap();
+            batch = mem::take(&mut *queue);
+        }
+        for nptr in batch {
+            let node = unsafe { &*nptr };
+            if node.refs.load(Ordering::Acquire) != 0 {
+                continue; // Revived (unlikely in this design)
             }
-            *alive_guard = false;
+            // Process death notifications
+            let mut death_guard = node.death_list.lock().unwrap();
+            let list_offset = mem::offset_of!(DeathNotification, list);
+            while !death_guard.is_empty() {
+                let entry_ptr = death_guard.next;
+                unsafe { ListHead::list_del(entry_ptr) };
+                let dn_ptr = unsafe {
+                    (entry_ptr as *mut u8).sub(list_offset) as *mut DeathNotification
+                };
+                // Simplified: no callback, just cleanup
+                // println!("Death notification cookie: {}", unsafe { (*dn_ptr).cookie });
+                unsafe { drop(Box::from_raw(dn_ptr)) };
+            }
+            drop(death_guard);
+            // Free the node
+            unsafe { drop(Box::from_raw(nptr)) };
         }
-
-        // Critical section: move list to temp (O(1))
-        let temp_list = {
-            let mut list_guard = self.death_list.lock().unwrap();
-            list_guard.take_all()
-        }; // locks dropped here
-
-        // High-concurrency cleanup (no locks held)
-        temp_list.notify_all();
-    }
-}
-
-impl Drop for BinderNode {
-    fn drop(&mut self) {
-        // Ensure cleanup even if caller forgets to call release()
-        self.release();
-    }
-}
-
-/// Example usage (for illustration; not part of the public API)
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::thread;
-
-    #[test]
-    fn test_concurrent_release_and_register() {
-        let node = Arc::new(BinderNode::new(42));
-
-        // Spawn many threads registering while one releases
-        let handles: Vec<_> = (0..10)
-            .map(|i| {
-                let node_clone = Arc::clone(&node);
-                thread::spawn(move || {
-                    node_clone.register_death_notification(move || {
-                        println!("Death notification {i} fired");
-                    });
-                })
-            })
-            .collect();
-
-        // Release from main thread
-        node.release();
-
-        // Wait for all registrars
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        // All callbacks that were registered *before* release have fired;
-        // any registered after were invoked immediately.
     }
 }
