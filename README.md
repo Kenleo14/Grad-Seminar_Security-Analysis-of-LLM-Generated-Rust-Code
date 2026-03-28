@@ -185,11 +185,11 @@ python3 generate_report.py \
 
 Summary table of pass counts per prompting strategy:
 
-| Strategy | Total_Samples | Stage1_rustc | Stage2_check | Stage2_clippy | Stage3_CodeQL_Pass | Stage3_CodeQL_Findings | Stage4_CVE_Heuristic |
+| Strategy | Total_Samples | Stage1_rustc | Stage2_check | Stage2_clippy | Stage3_CodeQL_Pass | Stage3_CodeQL_Findings | Stage4_Unsafe_Count |
 |---|---|---|---|---|---|---|---|
-| Chain-of-Thought | 10 | 0 | 1 | 0 | 1 | 0 | 0 |
-| Constraint-Based | 10 | 0 | 1 | 0 | 1 | 0 | 0 |
-| Zero-Shot | 10 | 0 | 2 | 0 | 2 | 0 | 0 |
+| Chain-of-Thought | 10 | 0 | 1 | 0 | 1 | 0 | 72 |
+| Constraint-Based | 10 | 0 | 1 | 0 | 1 | 0 | 87 |
+| Zero-Shot | 10 | 0 | 2 | 0 | 2 | 0 | 71 |
 
 **Column descriptions:**
 
@@ -200,8 +200,8 @@ Summary table of pass counts per prompting strategy:
 | `Stage2_check` | Files that passed `cargo check` |
 | `Stage2_clippy` | Files that passed `cargo clippy` (strict mode) |
 | `Stage3_CodeQL_Pass` | Files that CodeQL successfully analyzed |
-| `Stage3_CodeQL_Findings` | Total security alerts found across all CodeQL-analyzed files |
-| `Stage4_CVE_Heuristic` | Files with **no** CVE-2025-68260 red-flag patterns |
+| `Stage3_CodeQL_Findings` | Total CWE security alerts found across all CodeQL-analyzed files |
+| `Stage4_Unsafe_Count` | Total number of `unsafe` blocks across all files per strategy |
 
 ### 2. Error Summary Report (`error_summary_report.csv`)
 
@@ -220,7 +220,10 @@ One row per file. Shows exactly why each file failed at each stage and what Code
 
 ### 3. Performance Chart (`performance_chart.png`)
 
-Grouped bar chart comparing pass counts across all stages and strategies. Generated automatically by `generate_report.py`.
+Two-subplot chart generated automatically by `generate_report.py`:
+
+- **Top subplot** — Pass counts for Stage 1–3 (compilation and CodeQL), Y-axis = number of samples passing
+- **Bottom subplot** — Count metrics: CodeQL security findings and total `unsafe` block count per strategy, on their own Y-axis scale (unsafe counts are much larger than pass/fail counts and cannot share the same axis)
 
 ---
 
