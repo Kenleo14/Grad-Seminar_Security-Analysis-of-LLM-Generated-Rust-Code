@@ -8,6 +8,7 @@ Reads combined_report.json from an input directory and produces:
 3. performance_chart.png: Grouped bar chart of success counts.
 """
 
+import hashlib
 import json
 import argparse
 import os
@@ -15,6 +16,24 @@ from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+
+def _stable_id(path_str: str) -> str:
+    return hashlib.sha256(path_str.encode("utf-8")).hexdigest()[:12]
+
+
+def _load_sarif(sarif_path: Path):
+    """Return (finding_count, sorted unique ruleId list) from a SARIF file."""
+    if not sarif_path.exists():
+        return 0, []
+    try:
+        with open(sarif_path, encoding="utf-8") as f:
+            data = json.load(f)
+        results = [r for run in data.get("runs", []) for r in run.get("results", [])]
+        rule_ids = sorted({r.get("ruleId", "") for r in results if r.get("ruleId")})
+        return len(results), rule_ids
+    except Exception:
+        return 0, []
 
 def main():
     parser = argparse.ArgumentParser(description="Generate CSV statistics and visualization.")
@@ -64,6 +83,11 @@ def main():
         s2_clippy_ok = file_data.get('clippy', {}).get('ok', False)
         s3_ok = file_data.get('codeql', {}).get('ok', False) if file_data.get('codeql') else False
 
+        # Load CodeQL SARIF findings (only present when codeql ran successfully)
+        sarif_path = input_dir / "codeql" / _stable_id(source) / "codeql-results.sarif"
+        codeql_finding_count, codeql_rule_ids = _load_sarif(sarif_path)
+        codeql_findings_str = ", ".join(codeql_rule_ids) if codeql_rule_ids else ("none" if s3_ok else "")
+
         records.append({
             'Strategy': strategy,
             'File': source,
@@ -71,16 +95,28 @@ def main():
             'Station 2: Project Compile (cargo check)': s2_check_ok,
             'Station 2: Idiomatic (cargo clippy)': s2_clippy_ok,
             'Station 3: Security Audit (CodeQL)': s3_ok,
+            'Station 3: CodeQL Findings': codeql_finding_count,
             'Station 4: CVE Mitigation (Heuristic)': stage4_success
         })
 
         # Capture Error Details
+        codeql_data = file_data.get('codeql') or {}
+        codeql_stderr = codeql_data.get('stderr', '').strip()
+        if s3_ok:
+            s3_issue = ""
+        elif "skipped" in codeql_stderr.lower():
+            s3_issue = codeql_stderr.split("\n")[0]   # first line only ("CodeQL skipped: ...")
+        else:
+            s3_issue = codeql_stderr
+
         error_details.append({
             'Strategy': strategy,
+            'File': source,
             'S1 Error': file_data.get('rustc_compile', {}).get('stderr', '').strip() if not s1_ok else '',
             'S2 Check Error': file_data.get('cargo_check', {}).get('stderr', '').strip() if not s2_check_ok else '',
             'S2 Clippy Issue': file_data.get('clippy', {}).get('stderr', '').strip() if not s2_clippy_ok else '',
-            'S3 CodeQL Issue': file_data.get('codeql', {}).get('stderr', '').strip() if file_data.get('codeql') and not s3_ok else '',
+            'S3 CodeQL Issue': s3_issue,
+            'S3 CodeQL Findings': codeql_findings_str,
             'S4 Heuristic Hits': str(cve_summary) if not stage4_success else ''
         })
 
@@ -93,27 +129,27 @@ def main():
         Stage1_rustc=('Station 1: Raw Compile (rustc)', 'sum'),
         Stage2_check=('Station 2: Project Compile (cargo check)', 'sum'),
         Stage2_clippy=('Station 2: Idiomatic (cargo clippy)', 'sum'),
-        Stage3_CodeQL=('Station 3: Security Audit (CodeQL)', 'sum'),
+        Stage3_CodeQL_Pass=('Station 3: Security Audit (CodeQL)', 'sum'),
+        Stage3_CodeQL_Findings=('Station 3: CodeQL Findings', 'sum'),
         Stage4_CVE_Heuristic=('Station 4: CVE Mitigation (Heuristic)', 'sum')
     )
     perf_csv = output_dir / "performance_report.csv"
     perf_summary.to_csv(perf_csv)
     print(f"✅ Performance report saved to: {perf_csv}")
 
-    # 3. Detailed Error Summary
-    # We aggregate unique errors per strategy to keep the CSV readable
-    error_summary = err_df.groupby('Strategy').agg(lambda x: " | ".join(set(filter(None, x))))
+    # 3. Detailed Error Summary — one row per file, not aggregated, so findings are visible
     error_csv = output_dir / "error_summary_report.csv"
-    error_summary.to_csv(error_csv)
+    err_df.to_csv(error_csv, index=False)
     print(f"✅ Error details saved to: {error_csv}")
 
     # 4. Visualization
-    plot_df = perf_summary.drop(columns=['Total_Samples']).reset_index()
+    plot_df = perf_summary.drop(columns=['Total_Samples', 'Stage3_CodeQL_Findings']).reset_index()
     melted_df = plot_df.melt(id_vars='Strategy', var_name='Metric', value_name='Success Count')
 
     sns.set_theme(style="whitegrid")
     plt.figure(figsize=(12, 7))
-    ax = sns.barplot(data=melted_df, x='Strategy', y='Success Count', hue='Metric', palette="viridis")
+    stage_palette = ["#2196F3", "#4CAF50", "#FF9800", "#F44336", "#9C27B0"]
+    ax = sns.barplot(data=melted_df, x='Strategy', y='Success Count', hue='Metric', palette=stage_palette)
 
     plt.title('LLM Performance by Prompting Strategy (Raw Success Counts)', fontsize=14, pad=15)
     plt.ylabel('Number of Successful Samples', fontsize=12)

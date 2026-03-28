@@ -251,12 +251,18 @@ def run_cargo_steps_for_rsfile(
             test_res = run_cmd(["cargo", "test"], cwd=tmpdir, timeout_s=timeout_s)
 
         return deps, check, clippy, test_res
-
+    
 
 def codeql_on_rsfile(rs_file: Path, out_dir: Path, timeout_s: int, query_suite: str) -> StepResult:
     out_dir.mkdir(parents=True, exist_ok=True)
-    db_dir = out_dir / "codeql-db"
-    sarif = out_dir / "codeql-results.sarif"
+
+    # BUG FIX 1: Resolve to absolute paths BEFORE entering the temp dir.
+    # db_dir and sarif were previously relative paths (e.g. "output/grok/codeql/abc123/...").
+    # When codeql runs with cwd=tmpdir, it resolves them relative to tmpdir, producing a
+    # path like /tmp/rs-sample-codeql-xyz/output/grok/codeql/... which does not exist.
+    # This is the same bug already fixed in rustc_compile_best_effort via .resolve().
+    db_dir = (out_dir / "codeql-db").resolve()
+    sarif = (out_dir / "codeql-results.sarif").resolve()
 
     if db_dir.exists():
         shutil.rmtree(db_dir)
@@ -265,6 +271,8 @@ def codeql_on_rsfile(rs_file: Path, out_dir: Path, timeout_s: int, query_suite: 
         tmpdir = Path(td)
         write_temp_cargo_project(tmpdir, rs_file)
 
+        # --build-mode=none means CodeQL indexes source directly without invoking cargo,
+        # so cargo fetch is not needed and is skipped to avoid network hangs.
         create = run_cmd(
             [
                 "codeql",
@@ -272,8 +280,7 @@ def codeql_on_rsfile(rs_file: Path, out_dir: Path, timeout_s: int, query_suite: 
                 "create",
                 str(db_dir),
                 "--language=rust",
-                "--command",
-                "cargo build",
+                "--build-mode=none",
             ],
             cwd=tmpdir,
             timeout_s=timeout_s,
@@ -290,12 +297,13 @@ def codeql_on_rsfile(rs_file: Path, out_dir: Path, timeout_s: int, query_suite: 
                 query_suite,
                 "--format=sarifv2.1.0",
                 f"--output={sarif}",
+                "--threads=1",
             ],
             cwd=tmpdir,
             timeout_s=timeout_s,
         )
         return analyze
-
+        
 
 def analyze_file(rs_file: Path, args: argparse.Namespace) -> FileReport:
     rustc_res = rustc_compile_best_effort(
@@ -319,6 +327,18 @@ def analyze_file(rs_file: Path, args: argparse.Namespace) -> FileReport:
                 returncode=2,
                 stdout="",
                 stderr="CodeQL skipped: --run-codeql set but --codeql-suite not provided.",
+            )
+        elif not check_res.ok:
+            # Skip CodeQL for files that fail cargo check: dependency resolution
+            # (cargo fetch) hangs or fails for unresolvable crates, and CodeQL
+            # analysis of uncompilable code produces no meaningful results.
+            codeql_res = StepResult(
+                ok=False,
+                cmd=[],
+                cwd=str(rs_file.parent),
+                returncode=1,
+                stdout="",
+                stderr="CodeQL skipped: cargo check failed.",
             )
         else:
             per_file_out = Path(args.output) / "codeql" / stable_id_for_file(rs_file)
