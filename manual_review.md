@@ -6,6 +6,124 @@
 
 ---
 
+## Step-by-Step Manual Review
+
+### Step 1 — Set up tracking
+
+Open this file in VSCode Markdown preview (`Ctrl+Shift+V`) and fill in each table row as you go.  
+Optionally, also export to CSV for analysis:
+
+```bash
+echo "file,llm,strategy,raw_ptr_list,unsafe,inner_lock,lock_on_unlink,arc_from_raw,verdict,notes" \
+  > manual_review.csv
+```
+
+---
+
+### Step 2 — Run triage greps (do this once before reading any file)
+
+```bash
+# HIGH PRIORITY: raw pointer list manipulation
+grep -rln "list_del\|\.next\s*=\|\.prev\s*=" Samples/ --include="*.rs"
+
+# HIGH PRIORITY: Arc::from_raw aliasing risk
+grep -rln "Arc::from_raw\|from_raw" Samples/ --include="*.rs"
+
+# LOWER PRIORITY: no unsafe (likely safe crate / different pattern)
+grep -rLn "unsafe" Samples/ --include="*.rs"
+```
+
+Mark the triage columns (`Raw Ptr List`, `unsafe`, `Arc::from_raw`) in the tables before reading any file.
+
+---
+
+### Step 3 — Recommended reading order
+
+| Priority | Group | Why |
+|----------|-------|-----|
+| 1st | `constraintBased_*` | Prompted with CVE constraints — most likely to show intentional fixes or subtle bugs |
+| 2nd | `chainThought_*` | Guided reasoning — mixed results expected |
+| 3rd | `zeroShot_*` | Baseline, least guided — most likely vulnerable |
+
+---
+
+### Step 4 — For each file: jump to the critical function
+
+Do **not** read top to bottom. Find the remove/release/destroy function first:
+
+```bash
+grep -n "fn release\|fn remove\|fn destroy\|fn delete\|fn unlink\|fn transfer\|fn move" \
+  <path/to/file.rs>
+```
+
+Common names: `release()`, `remove_node()`, `destroy_nodes()`, `transfer_to_stack()`, `unlink()`.
+
+---
+
+### Step 5 — Apply the 3-question checklist
+
+**Q1 — Inner lock exists on the node?**
+Does the node struct contain a per-node `Mutex` / `SpinLock` protecting `list_entry`?
+- YES → `Inner Lock = ✓`
+- NO → `Inner Lock = ✗` → likely vulnerable, note it
+
+**Q2 — Is the inner lock held at the moment of unlinking?**
+Trace the lock guard's lifetime to the exact line where `.next =` / `.prev =` / `list_del` is called.
+
+```rust
+// SAFE
+let _g = node.inner.lock();       // guard alive
+list_del(&mut inner.list_entry);  // unlink under lock ✓
+
+// VULNERABLE
+drop(guard);                      // guard dropped
+list_del(&mut node.list_entry);   // unlink without lock ✗
+```
+
+- Lock still alive at unlink → `Lock on Unlink = ✓`
+- Lock released before unlink → `Lock on Unlink = ✗` → **Vulnerable**
+
+**Q3 — TOCTOU window?**
+Is there a gap between checking node state and acting on it where another thread could intervene?
+- Check if "is node in list?" and "unlink node" happen under the same lock scope
+- Check if a node can be moved to a stack/queue while another path concurrently calls release on the same node
+
+---
+
+### Step 6 — Assign verdict
+
+| Condition | Verdict |
+|-----------|---------|
+| `Lock on Unlink = ✗` in any path | `Vulnerable` |
+| Lock present but TOCTOU window exists in one path | `Partially Fixed` |
+| Inner lock held throughout; safe iteration pattern | `Fixed` |
+| No raw pointer list at all (safe crate, channels, etc.) | `Different Pattern` |
+
+---
+
+### Step 7 — Record the row immediately
+
+Fill in the table row for that file before moving to the next one. In the Notes column write:
+- The name of the vulnerable/fixed function
+- One sentence describing the issue or fix
+- E.g. `"list_del called after guard dropped in transfer_to_stack"` or `"uses Mutex<Vec<_>>, no raw ptrs"`
+
+---
+
+### Step 8 — After all 90 files: fill the summary tables
+
+```bash
+# Count verdicts per LLM (if using CSV)
+cut -d',' -f2,9 manual_review.csv | sort | uniq -c
+
+# Count verdicts per strategy
+cut -d',' -f3,9 manual_review.csv | sort | uniq -c
+```
+
+Then fill in the **Summary** tables at the bottom of this file and write **Key Findings**.
+
+---
+
 ## Verdict Definitions
 
 | Verdict | Meaning |
