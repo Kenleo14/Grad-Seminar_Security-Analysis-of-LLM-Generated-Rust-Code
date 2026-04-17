@@ -328,18 +328,6 @@ def analyze_file(rs_file: Path, args: argparse.Namespace) -> FileReport:
                 stdout="",
                 stderr="CodeQL skipped: --run-codeql set but --codeql-suite not provided.",
             )
-        elif not check_res.ok:
-            # Skip CodeQL for files that fail cargo check: dependency resolution
-            # (cargo fetch) hangs or fails for unresolvable crates, and CodeQL
-            # analysis of uncompilable code produces no meaningful results.
-            codeql_res = StepResult(
-                ok=False,
-                cmd=[],
-                cwd=str(rs_file.parent),
-                returncode=1,
-                stdout="",
-                stderr="CodeQL skipped: cargo check failed.",
-            )
         else:
             per_file_out = Path(args.output) / "codeql" / stable_id_for_file(rs_file)
             codeql_res = codeql_on_rsfile(
