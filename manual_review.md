@@ -174,16 +174,16 @@ Likely uses safe crate patterns → verdict usually `Different Pattern`.
 
 | # | File | Raw Ptr List | unsafe | Inner Lock | Lock on Unlink | Arc::from_raw | Verdict | Notes |
 |---|------|:---:|:---:|:---:|:---:|:---:|---------|-------|
-| 1 | [cveCHAIN_1.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_1.rs) | | | | | | | |
-| 2 | [cveCHAIN_2.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_2.rs) | | | | | | | |
-| 3 | [cveCHAIN_3.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_3.rs) | | | | | | | |
-| 4 | [cveCHAIN_4.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_4.rs) | | | | | | | |
-| 5 | [cveCHAIN_5.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_5.rs) | | | | | | | |
-| 6 | [cveCHAIN_6.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_6.rs) | | | | | | | |
-| 7 | [cveCHAIN_7.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_7.rs) | | | | | | | |
-| 8 | [cveCHAIN_8.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_8.rs) | | | | | | | |
-| 9 | [cveCHAIN_9.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_9.rs) | | | | | | | |
-| 10 | [cveCHAIN_10.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_10.rs) | | | | | | | |
+| 1 | [cveCHAIN_1.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_1.rs) | ✓ | ✓ | | | ✓ | | |
+| 2 | [cveCHAIN_2.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_2.rs) | ✗ | ✗ | | | ✗ | | |
+| 3 | [cveCHAIN_3.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_3.rs) | ✓ | ✓ | | | ✗ | | |
+| 4 | [cveCHAIN_4.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_4.rs) | ✓ | ✓ | | | ✗ | | |
+| 5 | [cveCHAIN_5.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_5.rs) | ✗ | ✗ | | | ✗ | | |
+| 6 | [cveCHAIN_6.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_6.rs) | ✓ | ✗ | | | ✗ | | |
+| 7 | [cveCHAIN_7.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_7.rs) | ✗ | ✗ | | | ✗ | | |
+| 8 | [cveCHAIN_8.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_8.rs) | ✗ | ✗ | | | ✗ | | |
+| 9 | [cveCHAIN_9.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_9.rs) | ✓ | ✓ | | | ✓ | | |
+| 10 | [cveCHAIN_10.rs](Samples/chatgpt/chainThought_Gp/cveCHAIN_10.rs) | ✓ | ✓ | | | ✗ | | |
 
 ---
 
@@ -191,16 +191,16 @@ Likely uses safe crate patterns → verdict usually `Different Pattern`.
 
 | # | File | Raw Ptr List | unsafe | Inner Lock | Lock on Unlink | Arc::from_raw | Verdict | Notes |
 |---|------|:---:|:---:|:---:|:---:|:---:|---------|-------|
-| 1 | [cveCONSTR_1.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_1.rs) | | | | | | | |
-| 2 | [cveCONSTR_2.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_2.rs) | | | | | | | |
-| 3 | [cveCONSTR_3.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_3.rs) | | | | | | | |
-| 4 | [cveCONSTR_4.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_4.rs) | | | | | | | |
-| 5 | [cveCONSTR_5.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_5.rs) | | | | | | | |
-| 6 | [cveCONSTR_6.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_6.rs) | | | | | | | |
-| 7 | [cveCONSTR_7.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_7.rs) | | | | | | | |
-| 8 | [cveCONSTR_8.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_8.rs) | | | | | | | |
-| 9 | [cveCONSTR_9.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_9.rs) | | | | | | | |
-| 10 | [cveCONSTR_10.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_10.rs) | | | | | | | |
+| 1 | [cveCONSTR_1.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_1.rs) | ✓ | ✓ | | | ✓ | | |
+| 2 | [cveCONSTR_2.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_2.rs) | ✓ | ✓ | | | ✓ | | |
+| 3 | [cveCONSTR_3.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_3.rs) | ✓ | ✓ | | | ✗ | | |
+| 4 | [cveCONSTR_4.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_4.rs) | ✓ | ✓ | | | ✗ | | |
+| 5 | [cveCONSTR_5.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_5.rs) | ✓ | ✓ | | | ✓ | | |
+| 6 | [cveCONSTR_6.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_6.rs) | ✓ | ✓ | | | ✓ | | |
+| 7 | [cveCONSTR_7.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_7.rs) | ✓ | ✓ | | | ✓ | | |
+| 8 | [cveCONSTR_8.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_8.rs) | ✓ | ✓ | | | ✗ | | |
+| 9 | [cveCONSTR_9.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_9.rs) | ✓ | ✓ | | | ✓ | | |
+| 10 | [cveCONSTR_10.rs](Samples/chatgpt/constraintBased_Gp/cveCONSTR_10.rs) | ✓ | ✓ | | | ✓ | | |
 
 ---
 
@@ -208,16 +208,16 @@ Likely uses safe crate patterns → verdict usually `Different Pattern`.
 
 | # | File | Raw Ptr List | unsafe | Inner Lock | Lock on Unlink | Arc::from_raw | Verdict | Notes |
 |---|------|:---:|:---:|:---:|:---:|:---:|---------|-------|
-| 1 | [cveZERO_1.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_1.rs) | | | | | | | |
-| 2 | [cveZERO_2.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_2.rs) | | | | | | | |
-| 3 | [cveZERO_3.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_3.rs) | | | | | | | |
-| 4 | [cveZERO_4.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_4.rs) | | | | | | | |
-| 5 | [cveZERO_5.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_5.rs) | | | | | | | |
-| 6 | [cveZERO_6.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_6.rs) | | | | | | | |
-| 7 | [cveZERO_7.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_7.rs) | | | | | | | |
-| 8 | [cveZERO_8.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_8.rs) | | | | | | | |
-| 9 | [cveZERO_9.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_9.rs) | | | | | | | |
-| 10 | [cveZERO_10.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_10.rs) | | | | | | | |
+| 1 | [cveZERO_1.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_1.rs) | ✗ | ✗ | | | ✗ | | |
+| 2 | [cveZERO_2.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_2.rs) | ✓ | ✓ | | | ✓ | | |
+| 3 | [cveZERO_3.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_3.rs) | ✗ | ✓ | | | ✗ | | |
+| 4 | [cveZERO_4.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_4.rs) | ✓ | ✓ | | | ✓ | | |
+| 5 | [cveZERO_5.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_5.rs) | ✓ | ✓ | | | ✓ | | |
+| 6 | [cveZERO_6.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_6.rs) | ✓ | ✓ | | | ✗ | | |
+| 7 | [cveZERO_7.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_7.rs) | ✓ | ✓ | | | ✓ | | |
+| 8 | [cveZERO_8.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_8.rs) | ✓ | ✓ | | | ✗ | | |
+| 9 | [cveZERO_9.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_9.rs) | ✗ | ✓ | | | ✓ | | |
+| 10 | [cveZERO_10.rs](Samples/chatgpt/zeroShot_Gp/cveZERO_10.rs) | ✗ | ✗ | | | ✗ | | |
 
 ---
 
@@ -225,16 +225,16 @@ Likely uses safe crate patterns → verdict usually `Different Pattern`.
 
 | # | File | Raw Ptr List | unsafe | Inner Lock | Lock on Unlink | Arc::from_raw | Verdict | Notes |
 |---|------|:---:|:---:|:---:|:---:|:---:|---------|-------|
-| 1 | [gemini_cveCHAIN_1.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_1.rs) | | | | | | | |
-| 2 | [gemini_cveCHAIN_2.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_2.rs) | | | | | | | |
-| 3 | [gemini_cveCHAIN_3.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_3.rs) | | | | | | | |
-| 4 | [gemini_cveCHAIN_4.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_4.rs) | | | | | | | |
-| 5 | [gemini_cveCHAIN_5.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_5.rs) | | | | | | | |
-| 6 | [gemini_cveCHAIN_6.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_6.rs) | | | | | | | |
-| 7 | [gemini_cveCHAIN_7.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_7.rs) | | | | | | | |
-| 8 | [gemini_cveCHAIN_8.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_8.rs) | | | | | | | |
-| 9 | [gemini_cveCHAIN_9.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_9.rs) | | | | | | | |
-| 10 | [gemini_cveCHAIN_10.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_10.rs) | | | | | | | |
+| 1 | [gemini_cveCHAIN_1.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_1.rs) | ✗ | ✓ | | | ✗ | | |
+| 2 | [gemini_cveCHAIN_2.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_2.rs) | ✗ | ✓ | | | ✗ | | |
+| 3 | [gemini_cveCHAIN_3.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_3.rs) | ✗ | ✓ | | | ✗ | | |
+| 4 | [gemini_cveCHAIN_4.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_4.rs) | ✗ | ✓ | | | ✗ | | |
+| 5 | [gemini_cveCHAIN_5.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_5.rs) | ✗ | ✓ | | | ✗ | | |
+| 6 | [gemini_cveCHAIN_6.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_6.rs) | ✗ | ✓ | | | ✗ | | |
+| 7 | [gemini_cveCHAIN_7.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_7.rs) | ✗ | ✓ | | | ✗ | | |
+| 8 | [gemini_cveCHAIN_8.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_8.rs) | ✗ | ✓ | | | ✗ | | |
+| 9 | [gemini_cveCHAIN_9.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_9.rs) | ✗ | ✓ | | | ✗ | | |
+| 10 | [gemini_cveCHAIN_10.rs](Samples/gemini/chainThought_Ge/gemini_cveCHAIN_10.rs) | ✗ | ✓ | | | ✗ | | |
 
 ---
 
@@ -242,16 +242,16 @@ Likely uses safe crate patterns → verdict usually `Different Pattern`.
 
 | # | File | Raw Ptr List | unsafe | Inner Lock | Lock on Unlink | Arc::from_raw | Verdict | Notes |
 |---|------|:---:|:---:|:---:|:---:|:---:|---------|-------|
-| 1 | [gemini_cveCONTR_1.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_1.rs) | | | | | | | |
-| 2 | [gemini_cveCONTR_2.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_2.rs) | | | | | | | |
-| 3 | [gemini_cveCONTR_3.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_3.rs) | | | | | | | |
-| 4 | [gemini_cveCONTR_4.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_4.rs) | | | | | | | |
-| 5 | [gemini_cveCONTR_5.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_5.rs) | | | | | | | |
-| 6 | [gemini_cveCONTR_6.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_6.rs) | | | | | | | |
-| 7 | [gemini_cveCONTR_7.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_7.rs) | | | | | | | |
-| 8 | [gemini_cveCONTR_8.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_8.rs) | | | | | | | |
-| 9 | [gemini_cveCONTR_9.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_9.rs) | | | | | | | |
-| 10 | [gemini_cveCONTR_10.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_10.rs) | | | | | | | |
+| 1 | [gemini_cveCONTR_1.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_1.rs) | ✓ | ✓ | | | ✓ | | |
+| 2 | [gemini_cveCONTR_2.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_2.rs) | ✓ | ✓ | | | ✓ | | |
+| 3 | [gemini_cveCONTR_3.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_3.rs) | ✓ | ✓ | | | ✓ | | |
+| 4 | [gemini_cveCONTR_4.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_4.rs) | ✗ | ✗ | | | ✗ | | |
+| 5 | [gemini_cveCONTR_5.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_5.rs) | ✓ | ✓ | | | ✗ | | |
+| 6 | [gemini_cveCONTR_6.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_6.rs) | ✓ | ✓ | | | ✓ | | |
+| 7 | [gemini_cveCONTR_7.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_7.rs) | ✓ | ✓ | | | ✓ | | |
+| 8 | [gemini_cveCONTR_8.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_8.rs) | ✓ | ✓ | | | ✗ | | |
+| 9 | [gemini_cveCONTR_9.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_9.rs) | ✓ | ✓ | | | ✗ | | |
+| 10 | [gemini_cveCONTR_10.rs](Samples/gemini/constraintBased_Ge/gemini_cveCONTR_10.rs) | ✓ | ✓ | | | ✗ | | |
 
 ---
 
@@ -259,16 +259,16 @@ Likely uses safe crate patterns → verdict usually `Different Pattern`.
 
 | # | File | Raw Ptr List | unsafe | Inner Lock | Lock on Unlink | Arc::from_raw | Verdict | Notes |
 |---|------|:---:|:---:|:---:|:---:|:---:|---------|-------|
-| 1 | [gemini_cveZERO_1.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_1.rs) | | | | | | | |
-| 2 | [gemini_cveZERO_2.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_2.rs) | | | | | | | |
-| 3 | [gemini_cveZERO_3.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_3.rs) | | | | | | | |
-| 4 | [gemini_cveZERO_4.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_4.rs) | | | | | | | |
-| 5 | [gemini_cveZERO_5.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_5.rs) | | | | | | | |
-| 6 | [gemini_cveZERO_6.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_6.rs) | | | | | | | |
-| 7 | [gemini_cveZERO_7.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_7.rs) | | | | | | | |
-| 8 | [gemini_cveZERO_8.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_8.rs) | | | | | | | |
-| 9 | [gemini_cveZERO_9.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_9.rs) | | | | | | | |
-| 10 | [gemini_cveZERO_10.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_10.rs) | | | | | | | |
+| 1 | [gemini_cveZERO_1.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_1.rs) | ✓ | ✓ | | | ✓ | | |
+| 2 | [gemini_cveZERO_2.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_2.rs) | ✗ | ✗ | | | ✗ | | |
+| 3 | [gemini_cveZERO_3.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_3.rs) | ✓ | ✓ | | | ✓ | | |
+| 4 | [gemini_cveZERO_4.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_4.rs) | ✗ | ✓ | | | ✗ | | |
+| 5 | [gemini_cveZERO_5.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_5.rs) | ✗ | ✗ | | | ✗ | | |
+| 6 | [gemini_cveZERO_6.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_6.rs) | ✗ | ✗ | | | ✗ | | |
+| 7 | [gemini_cveZERO_7.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_7.rs) | ✓ | ✓ | | | ✓ | | |
+| 8 | [gemini_cveZERO_8.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_8.rs) | ✓ | ✓ | | | ✓ | | |
+| 9 | [gemini_cveZERO_9.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_9.rs) | ✗ | ✗ | | | ✗ | | |
+| 10 | [gemini_cveZERO_10.rs](Samples/gemini/zeroShot_Ge/gemini_cveZERO_10.rs) | ✗ | ✓ | | | ✓ | | |
 
 ---
 
@@ -276,16 +276,16 @@ Likely uses safe crate patterns → verdict usually `Different Pattern`.
 
 | # | File | Raw Ptr List | unsafe | Inner Lock | Lock on Unlink | Arc::from_raw | Verdict | Notes |
 |---|------|:---:|:---:|:---:|:---:|:---:|---------|-------|
-| 1 | [grok_cveCHAIN_1.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_1.rs) | | | | | | | |
-| 2 | [grok_cveCHAIN_2.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_2.rs) | | | | | | | |
-| 3 | [grok_cveCHAIN_3.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_3.rs) | | | | | | | |
-| 4 | [grok_cveCHAIN_4.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_4.rs) | | | | | | | |
-| 5 | [grok_cveCHAIN_5.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_5.rs) | | | | | | | |
-| 6 | [grok_cveCHAIN_6.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_6.rs) | | | | | | | |
-| 7 | [grok_cveCHAIN_7.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_7.rs) | | | | | | | |
-| 8 | [grok_cveCHAIN_8.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_8.rs) | | | | | | | |
-| 9 | [grok_cveCHAIN_9.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_9.rs) | | | | | | | |
-| 10 | [grok_cveCHAIN_10.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_10.rs) | | | | | | | |
+| 1 | [grok_cveCHAIN_1.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_1.rs) | ✓ | ✓ | | | ✗ | | |
+| 2 | [grok_cveCHAIN_2.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_2.rs) | ✓ | ✓ | | | ✗ | | |
+| 3 | [grok_cveCHAIN_3.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_3.rs) | ✓ | ✓ | | | ✗ | | |
+| 4 | [grok_cveCHAIN_4.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_4.rs) | ✓ | ✓ | | | ✗ | | |
+| 5 | [grok_cveCHAIN_5.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_5.rs) | ✗ | ✓ | | | ✓ | | |
+| 6 | [grok_cveCHAIN_6.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_6.rs) | ✓ | ✓ | | | ✓ | | |
+| 7 | [grok_cveCHAIN_7.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_7.rs) | ✓ | ✓ | | | ✓ | | |
+| 8 | [grok_cveCHAIN_8.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_8.rs) | ✓ | ✓ | | | ✗ | | |
+| 9 | [grok_cveCHAIN_9.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_9.rs) | ✓ | ✓ | | | ✓ | | |
+| 10 | [grok_cveCHAIN_10.rs](Samples/grok/chainThought_Gr/grok_cveCHAIN_10.rs) | ✗ | ✓ | | | ✗ | | |
 
 ---
 
@@ -293,16 +293,16 @@ Likely uses safe crate patterns → verdict usually `Different Pattern`.
 
 | # | File | Raw Ptr List | unsafe | Inner Lock | Lock on Unlink | Arc::from_raw | Verdict | Notes |
 |---|------|:---:|:---:|:---:|:---:|:---:|---------|-------|
-| 1 | [grok_cveCONSTR_1.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_1.rs) | | | | | | | |
-| 2 | [grok_cveCONSTR_2.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_2.rs) | | | | | | | |
-| 3 | [grok_cveCONSTR_3.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_3.rs) | | | | | | | |
-| 4 | [grok_cveCONSTR_4.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_4.rs) | | | | | | | |
-| 5 | [grok_cveCONSTR_5.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_5.rs) | | | | | | | |
-| 6 | [grok_cveCONSTR_6.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_6.rs) | | | | | | | |
-| 7 | [grok_cveCONSTR_7.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_7.rs) | | | | | | | |
-| 8 | [grok_cveCONSTR_8.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_8.rs) | | | | | | | |
-| 9 | [grok_cveCONSTR_9.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_9.rs) | | | | | | | |
-| 10 | [grok_cveCONSTR_10.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_10.rs) | | | | | | | |
+| 1 | [grok_cveCONSTR_1.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_1.rs) | ✓ | ✓ | | | ✗ | | |
+| 2 | [grok_cveCONSTR_2.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_2.rs) | ✓ | ✓ | | | ✗ | | |
+| 3 | [grok_cveCONSTR_3.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_3.rs) | ✓ | ✓ | | | ✗ | | |
+| 4 | [grok_cveCONSTR_4.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_4.rs) | ✓ | ✓ | | | ✗ | | |
+| 5 | [grok_cveCONSTR_5.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_5.rs) | ✓ | ✓ | | | ✓ | | |
+| 6 | [grok_cveCONSTR_6.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_6.rs) | ✓ | ✓ | | | ✗ | | |
+| 7 | [grok_cveCONSTR_7.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_7.rs) | ✓ | ✓ | | | ✗ | | |
+| 8 | [grok_cveCONSTR_8.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_8.rs) | ✓ | ✓ | | | ✗ | | |
+| 9 | [grok_cveCONSTR_9.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_9.rs) | ✓ | ✓ | | | ✗ | | |
+| 10 | [grok_cveCONSTR_10.rs](Samples/grok/constraintBased_Gr/grok_cveCONSTR_10.rs) | ✓ | ✓ | | | ✗ | | |
 
 ---
 
@@ -310,16 +310,16 @@ Likely uses safe crate patterns → verdict usually `Different Pattern`.
 
 | # | File | Raw Ptr List | unsafe | Inner Lock | Lock on Unlink | Arc::from_raw | Verdict | Notes |
 |---|------|:---:|:---:|:---:|:---:|:---:|---------|-------|
-| 1 | [grok_cveZERO_1.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_1.rs) | | | | | | | |
-| 2 | [grok_cveZERO_2.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_2.rs) | | | | | | | |
-| 3 | [grok_cveZERO_3.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_3.rs) | | | | | | | |
-| 4 | [grok_cveZERO_4.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_4.rs) | | | | | | | |
-| 5 | [grok_cveZERO_5.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_5.rs) | | | | | | | |
-| 6 | [grok_cveZERO_6.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_6.rs) | | | | | | | |
-| 7 | [grok_cveZERO_7.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_7.rs) | | | | | | | |
-| 8 | [grok_cveZERO_8.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_8.rs) | | | | | | | |
-| 9 | [grok_cveZERO_9.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_9.rs) | | | | | | | |
-| 10 | [grok_cveZERO_10.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_10.rs) | | | | | | | |
+| 1 | [grok_cveZERO_1.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_1.rs) | ✗ | ✓ | | | ✗ | | |
+| 2 | [grok_cveZERO_2.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_2.rs) | ✓ | ✓ | | | ✓ | | |
+| 3 | [grok_cveZERO_3.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_3.rs) | ✓ | ✓ | | | ✗ | | |
+| 4 | [grok_cveZERO_4.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_4.rs) | ✓ | ✓ | | | ✗ | | |
+| 5 | [grok_cveZERO_5.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_5.rs) | ✗ | ✗ | | | ✗ | | |
+| 6 | [grok_cveZERO_6.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_6.rs) | ✗ | ✓ | | | ✓ | | |
+| 7 | [grok_cveZERO_7.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_7.rs) | ✓ | ✓ | | | ✓ | | |
+| 8 | [grok_cveZERO_8.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_8.rs) | ✓ | ✓ | | | ✓ | | |
+| 9 | [grok_cveZERO_9.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_9.rs) | ✗ | ✓ | | | ✗ | | |
+| 10 | [grok_cveZERO_10.rs](Samples/grok/zeroShot_Gr/grok_cveZERO_10.rs) | ✓ | ✓ | | | ✓ | | |
 
 ---
 

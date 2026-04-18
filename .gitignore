@@ -1,4 +1,5 @@
 .venv
 output/grok/*
 output/gemini/*
-output/claude/*
+output/chatgpt/*
+output_copy
